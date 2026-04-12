@@ -25,6 +25,9 @@ import struct
 import sys
 import time
 
+# Log file — defined early so logging.basicConfig can use it
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inventor_camera.log")
+
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s  %(levelname)-7s  %(message)s",
@@ -61,7 +64,7 @@ ORBIT_SENSITIVITY = 0.008
 # Increase for faster pan.
 PAN_SENSITIVITY = 0.003
 
-# Seconds between Inventor reconnect attempts (when Inventor is not yet open)
+# Seconds between Inventor reconnect attempts
 RECONNECT_INTERVAL = 2.0
 
 # Inventor document type constants (from Inventor API)
@@ -72,9 +75,6 @@ kAssemblyDocumentObject = 12291
 # Inventor default part/assembly templates are Y-up.
 # Change to np.array([0.0, 0.0, 1.0]) if your models use Z-up.
 WORLD_UP = np.array([0.0, 1.0, 0.0])
-
-# Log file path (useful when server runs windowless via pyw.exe)
-LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inventor_camera.log")
 # -
 
 
