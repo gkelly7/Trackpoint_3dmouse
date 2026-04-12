@@ -335,10 +335,11 @@ OnTrackpointMove(x, y) {
         return
 
     ; ==================== 3D MOUSE ====================
-    ; In Inventor desk mode: route deltas to Python server.
-    ; Center button held = pan mode (mode=1); otherwise orbit (mode=0).
-    ; No cursor movement, no button click - fully cursor-independent.
+    ; Dead zone: skip tiny drift events so TrackPoint drift
+    ; does not flood Inventor with COM calls.
     if WinActive("ahk_exe Inventor.exe") {
+        if (Abs(x) < 2 && Abs(y) < 2)
+            return
         Send3DMove(x, y, isShiftDown ? 1 : 0)
         return
     }

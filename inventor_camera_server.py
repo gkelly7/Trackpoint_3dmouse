@@ -254,7 +254,6 @@ def main() -> None:
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((UDP_HOST, UDP_PORT))
-    sock.settimeout(RECONNECT_INTERVAL)
 
     log.info("Inventor camera server  UDP %s:%d", UDP_HOST, UDP_PORT)
     log.info("Orbit sensitivity: %.4f  Pan sensitivity: %.4f",
@@ -262,24 +261,51 @@ def main() -> None:
 
     app            = None
     last_reconnect = 0.0
+    FRAME_S        = 0.033   # 30 Hz max -- prevents flooding Inventors COM queue
 
     try:
         while True:
             now = time.monotonic()
 
+            # Reconnect to Inventor if not connected
             if app is None and (now - last_reconnect) >= RECONNECT_INTERVAL:
                 last_reconnect = now
-                _cs["valid"] = False   # force re-read on next orbit
+                _cs["valid"] = False
                 app = get_inventor()
                 if app:
                     log.info("Connected to Inventor.")
                 else:
                     log.info("Waiting for Inventor to start...")
 
-            try:
-                data, _ = sock.recvfrom(64)
-            except socket.timeout:
-                if app is not None:
+            # Drain ALL pending UDP packets within one frame window,
+            # accumulating into a single orbit+pan delta.
+            # This caps cam.Apply() calls at 30/s regardless of TrackPoint rate.
+            orbit_dx = orbit_dy = 0
+            pan_dx   = pan_dy   = 0
+            deadline = time.monotonic() + FRAME_S
+
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                sock.settimeout(max(remaining, 0.001))
+                try:
+                    data, _ = sock.recvfrom(64)
+                except socket.timeout:
+                    break
+                if len(data) < 9:
+                    continue
+                x, y = struct.unpack_from("<ii", data, 0)
+                mode = struct.unpack_from("<B",  data, 8)[0]
+                if mode == 0:
+                    orbit_dx += x;  orbit_dy += y
+                else:
+                    pan_dx   += x;  pan_dy   += y
+
+            # Ping Inventor if idle (detect crashes)
+            if app is not None and orbit_dx == 0 and orbit_dy == 0                     and pan_dx == 0 and pan_dy == 0:
+                if (time.monotonic() - last_reconnect) > RECONNECT_INTERVAL * 5:
+                    last_reconnect = time.monotonic()
                     try:
                         _ = app.Caption
                     except Exception:
@@ -288,19 +314,17 @@ def main() -> None:
                         _cs["valid"] = False
                 continue
 
-            if len(data) < 9 or app is None:
+            if app is None:
                 continue
 
-            x, y = struct.unpack_from("<ii", data, 0)
-            mode  = struct.unpack_from("<B",  data, 8)[0]
-
+            # Single camera update per frame
             try:
-                if mode == 0:
-                    do_orbit(app, x, y)
-                else:
-                    do_pan(app, x, y)
+                if orbit_dx or orbit_dy:
+                    do_orbit(app, orbit_dx, orbit_dy)
+                if pan_dx or pan_dy:
+                    do_pan(app, pan_dx, pan_dy)
             except Exception as exc:
-                log.warning("Camera command failed: %s -- reconnecting", exc)
+                log.warning("Camera command failed: %s", exc)
                 app = None
                 _cs["valid"] = False
 
