@@ -336,8 +336,8 @@ OnTrackpointMove(x, y) {
 
     ; ==================== 3D MOUSE ====================
     ; In Inventor desk mode: route deltas to Python server.
-    ; Center button held → pan mode (mode=1); otherwise orbit (mode=0).
-    ; No cursor movement, no button click — fully cursor-independent.
+    ; Center button held = pan mode (mode=1); otherwise orbit (mode=0).
+    ; No cursor movement, no button click - fully cursor-independent.
     if WinActive("ahk_exe Inventor.exe") {
         Send3DMove(x, y, isShiftDown ? 1 : 0)
         return
