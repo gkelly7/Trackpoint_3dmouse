@@ -109,7 +109,7 @@ NumPut("UInt",   DllCall("ws2_32\inet_addr","AStr",   "127.0.0.1","UInt"),      
 ; Launch the Python camera server (pythonw = no console window)
 _pyScript := A_ScriptDir "\inventor_camera_server.py"
 if FileExist(_pyScript) {
-    Run('pythonw.exe "' _pyScript '"', A_ScriptDir, "Hide", &gPythonPID)
+    Run('pyw.exe "' _pyScript '"', A_ScriptDir, "Hide", &gPythonPID)
 } else {
     MsgBox(
         "inventor_camera_server.py not found.`n" .
