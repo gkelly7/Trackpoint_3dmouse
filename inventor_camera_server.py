@@ -19,15 +19,20 @@ Tune ORBIT_SENSITIVITY and PAN_SENSITIVITY to taste.
 
 import logging
 import math
+import os
 import socket
 import struct
 import sys
 import time
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8"),
+    ]
 )
 log = logging.getLogger(__name__)
 
@@ -44,13 +49,13 @@ except ImportError:
     log.error("numpy not installed.  Run:  pip install numpy")
     sys.exit(1)
 
-# ─── Configuration ────────────────────────────────────────────────────────────
+# - Configuration -
 UDP_HOST = "127.0.0.1"
 UDP_PORT = 9999
 
 # Radians per TrackPoint delta unit.
 # Increase for faster orbit, decrease for finer control.
-ORBIT_SENSITIVITY = 0.010
+ORBIT_SENSITIVITY = 0.008
 
 # Fraction of eye-target distance per TrackPoint delta unit.
 # Increase for faster pan.
@@ -63,9 +68,14 @@ RECONNECT_INTERVAL = 2.0
 kPartDocumentObject     = 12290
 kAssemblyDocumentObject = 12291
 
-# World up vector (Inventor default is Z-up)
-WORLD_UP = np.array([0.0, 0.0, 1.0])
-# ──────────────────────────────────────────────────────────────────────────────
+# Which world axis points "up" in your Inventor templates.
+# Inventor default part/assembly templates are Y-up.
+# Change to np.array([0.0, 0.0, 1.0]) if your models use Z-up.
+WORLD_UP = np.array([0.0, 1.0, 0.0])
+
+# Log file path (useful when server runs windowless via pyw.exe)
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inventor_camera.log")
+# -
 
 
 def get_inventor():
@@ -76,18 +86,87 @@ def get_inventor():
         return None
 
 
-def rodrigues(v: np.ndarray, axis: np.ndarray, angle: float) -> np.ndarray:
-    """Rotate vector *v* around *axis* by *angle* radians (Rodrigues' formula)."""
-    norm = np.linalg.norm(axis)
-    if norm < 1e-10:
-        return v.copy()
-    axis = axis / norm
-    c, s = math.cos(angle), math.sin(angle)
-    return v * c + np.cross(axis, v) * s + axis * np.dot(axis, v) * (1.0 - c)
+def _active_3d_view(app):
+    """Return (view, camera, tg) for the active Part/Assembly doc, or None."""
+    try:
+        doc = app.ActiveDocument
+        if doc is None:
+            return None
+        if doc.DocumentType not in (kPartDocumentObject, kAssemblyDocumentObject):
+            return None
+        view = doc.Views.Item(1)
+        return view, view.Camera, app.TransientGeometry
+    except Exception as exc:
+        log.debug("_active_3d_view: %s", exc)
+        return None
 
 
-def _get_camera_vectors(cam):
-    """Return (eye, target, up, offset, fwd, right) as numpy arrays, or raise."""
+def do_orbit(app, dx: int, dy: int) -> None:
+    """
+    Orbit camera using spherical coordinates relative to WORLD_UP.
+    Avoids any roll accumulation. Works correctly for Y-up (default Inventor).
+    """
+    result = _active_3d_view(app)
+    if result is None:
+        return
+    view, cam, tg = result
+
+    eye    = np.array([cam.Eye.X,    cam.Eye.Y,    cam.Eye.Z   ], dtype=float)
+    target = np.array([cam.Target.X, cam.Target.Y, cam.Target.Z], dtype=float)
+
+    offset = eye - target
+    r      = np.linalg.norm(offset)
+    if r < 1e-9:
+        return
+
+    up = WORLD_UP / np.linalg.norm(WORLD_UP)
+
+    # Build two floor-plane axes orthogonal to WORLD_UP
+    ref   = np.array([1., 0., 0.]) if abs(np.dot(up, [1., 0., 0.])) < 0.9 else np.array([0., 0., 1.])
+    east  = np.cross(up, ref);  east  /= np.linalg.norm(east)
+    north = np.cross(east, up)
+
+    # Decompose current offset into spherical angles
+    elev = math.asin(np.clip(np.dot(offset / r, up), -1.0, 1.0))
+    proj = offset - up * np.dot(offset, up)
+    proj_len = np.linalg.norm(proj)
+    azim = math.atan2(np.dot(proj / proj_len, east),
+                      np.dot(proj / proj_len, north)) if proj_len > 1e-9 else 0.0
+
+    # Increment angles
+    azim += dx * ORBIT_SENSITIVITY
+    elev  = float(np.clip(elev + dy * ORBIT_SENSITIVITY,
+                          -math.pi / 2 + 0.02, math.pi / 2 - 0.02))
+
+    # Reconstruct eye position
+    cos_e      = math.cos(elev)
+    new_offset = r * (up * math.sin(elev) +
+                      north * cos_e * math.cos(azim) +
+                      east  * cos_e * math.sin(azim))
+    new_eye    = target + new_offset
+
+    # Keep up vector perpendicular to view direction, no roll
+    nfwd   = new_offset / np.linalg.norm(new_offset)
+    new_up = up - nfwd * np.dot(nfwd, up)
+    nup_n  = np.linalg.norm(new_up)
+    if nup_n > 1e-9:
+        new_up /= nup_n
+        cam.UpVector = tg.CreateUnitVector(
+            float(new_up[0]), float(new_up[1]), float(new_up[2]))
+
+    cam.Eye = tg.CreatePoint(float(new_eye[0]), float(new_eye[1]), float(new_eye[2]))
+    cam.Apply()
+    log.debug("orbit dx=%d dy=%d  azim=%.1fdeg elev=%.1fdeg", dx, dy,
+              math.degrees(azim), math.degrees(elev))
+
+
+def do_pan(app, dx: int, dy: int) -> None:
+    """Pan camera (translate eye + target together in the camera plane)."""
+    result = _active_3d_view(app)
+    if result is None:
+        return
+    view, cam, tg = result
+
     eye    = np.array([cam.Eye.X,    cam.Eye.Y,    cam.Eye.Z   ], dtype=float)
     target = np.array([cam.Target.X, cam.Target.Y, cam.Target.Z], dtype=float)
     up     = np.array([cam.UpVector.X, cam.UpVector.Y, cam.UpVector.Z], dtype=float)
@@ -95,99 +174,30 @@ def _get_camera_vectors(cam):
     offset = eye - target
     dist   = np.linalg.norm(offset)
     if dist < 1e-9:
-        raise ValueError("Eye coincides with target")
+        return
 
     fwd   = offset / dist
-    right = np.cross(fwd, up)           # points camera-LEFT (see SETUP.md note)
+    right = np.cross(fwd, up)
     r_len = np.linalg.norm(right)
     if r_len < 1e-9:
-        raise ValueError("Camera looking along world-up axis")
+        return
     right /= r_len
 
-    return eye, target, up, offset, fwd, right
-
-
-def do_orbit(app, dx: int, dy: int) -> None:
-    """
-    Orbit the camera around the target point.
-    - dx > 0  →  orbit right  (see right face of model)
-    - dy > 0  →  orbit down   (see bottom of model, matches Inventor cursor convention)
-    """
-    doc = app.ActiveDocument
-    if doc is None:
-        return
-    if doc.DocumentType not in (kPartDocumentObject, kAssemblyDocumentObject):
-        return
-
-    view = doc.Views.Item(1)
-    cam  = view.Camera
-    tg   = app.TransientGeometry
-
-    eye, target, up, offset, fwd, right = _get_camera_vectors(cam)
-
-    # Horizontal orbit: rotate around WORLD_UP to prevent camera roll
-    if dx:
-        offset = rodrigues(offset, WORLD_UP, dx * ORBIT_SENSITIVITY)
-
-    # Vertical orbit: rotate around camera-right axis (pitch)
-    if dy:
-        offset = rodrigues(offset, right, dy * ORBIT_SENSITIVITY)
-
-    new_eye = target + offset
-
-    # Recompute camera up: project WORLD_UP onto the plane ⊥ to new view dir,
-    # keeping the horizon stable across many orbit steps.
-    nfwd   = offset / np.linalg.norm(offset)
-    new_up = WORLD_UP - nfwd * np.dot(nfwd, WORLD_UP)
-    nup_n  = np.linalg.norm(new_up)
-    if nup_n > 1e-9:
-        new_up /= nup_n
-        cam.UpVector = tg.CreateUnitVector(
-            float(new_up[0]), float(new_up[1]), float(new_up[2])
-        )
-
-    cam.Eye = tg.CreatePoint(float(new_eye[0]), float(new_eye[1]), float(new_eye[2]))
-    cam.Apply()
-
-
-def do_pan(app, dx: int, dy: int) -> None:
-    """
-    Pan the camera (translate eye + target in the camera plane).
-    - dx > 0  →  pan right  (model shifts right in view)
-    - dy > 0  →  pan down   (model shifts down in view)
-    """
-    doc = app.ActiveDocument
-    if doc is None:
-        return
-    if doc.DocumentType not in (kPartDocumentObject, kAssemblyDocumentObject):
-        return
-
-    view = doc.Views.Item(1)
-    cam  = view.Camera
-    tg   = app.TransientGeometry
-
-    eye, target, up, offset, fwd, right = _get_camera_vectors(cam)
-
-    # Camera up in world space: cross(right, fwd)
-    # (right = cross(fwd, up) so right × fwd points upward in the view)
     cam_up = np.cross(right, fwd)
     cu_n   = np.linalg.norm(cam_up)
     if cu_n < 1e-9:
         return
     cam_up /= cu_n
 
-    # Scale pan speed by distance so it feels consistent at any zoom level
-    dist  = np.linalg.norm(offset)
     scale = dist * PAN_SENSITIVITY
+    delta = right * (dx * scale) + cam_up * (dy * scale)
 
-    # right points camera-LEFT, so dx>0 moves eye left → model appears to move right
-    delta  = right * (dx * scale) + cam_up * (dy * scale)
-    ne     = eye    + delta
-    nt     = target + delta
-
+    ne = eye    + delta
+    nt = target + delta
     cam.Eye    = tg.CreatePoint(float(ne[0]), float(ne[1]), float(ne[2]))
     cam.Target = tg.CreatePoint(float(nt[0]), float(nt[1]), float(nt[2]))
     cam.Apply()
+    log.debug("pan dx=%d dy=%d", dx, dy)
 
 
 def main() -> None:
@@ -199,7 +209,7 @@ def main() -> None:
 
     log.info("Inventor camera server listening on UDP %s:%d", UDP_HOST, UDP_PORT)
     log.info("Orbit sensitivity : %.4f rad/unit", ORBIT_SENSITIVITY)
-    log.info("Pan sensitivity   : %.4f × dist/unit", PAN_SENSITIVITY)
+    log.info("Pan sensitivity   : %.4f - dist/unit", PAN_SENSITIVITY)
 
     app            = None
     last_reconnect = 0.0
@@ -215,7 +225,7 @@ def main() -> None:
                 if app:
                     log.info("Connected to Inventor.")
                 else:
-                    log.info("Waiting for Inventor to start…")
+                    log.info("Waiting for Inventor to start-")
 
             # Receive UDP packet from AHK
             try:
@@ -226,7 +236,7 @@ def main() -> None:
                     try:
                         _ = app.Caption  # lightweight ping
                     except Exception:
-                        log.info("Lost connection to Inventor — will reconnect.")
+                        log.info("Lost connection to Inventor - will reconnect.")
                         app = None
                 continue
 
@@ -245,7 +255,7 @@ def main() -> None:
                 else:
                     do_pan(app, x, y)
             except Exception as exc:
-                log.debug("Camera command failed (%s) — forcing reconnect.", exc)
+                log.debug("Camera command failed (%s) - forcing reconnect.", exc)
                 app = None
 
     except KeyboardInterrupt:
