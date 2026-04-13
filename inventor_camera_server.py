@@ -168,6 +168,20 @@ def _active_view(app):
         return None
 
 
+def _apply_cam(cam) -> None:
+    """Apply camera without Inventor's blocking view-transition animation.
+
+    Inventor's cam.Apply() triggers a smooth fly-to animation that blocks
+    the calling thread for ~1 s, causing stale UDP packets to pile up.
+    ApplyWithoutTransition() is instant and non-blocking.
+    Falls back to Apply() for older Inventor builds that lack the method.
+    """
+    try:
+        cam.ApplyWithoutTransition()
+    except Exception:
+        cam.Apply()
+
+
 # ---------------------------------------------------------------------------
 # Orbit / Pan
 # ---------------------------------------------------------------------------
@@ -201,7 +215,7 @@ def do_orbit(app, dx: int, dy: int) -> None:
         float(new_up[0]), float(new_up[1]), float(new_up[2]))
     cam.Eye = tg.CreatePoint(
         float(new_eye[0]), float(new_eye[1]), float(new_eye[2]))
-    cam.Apply()
+    _apply_cam(cam)
 
     log.debug("orbit dx=%3d dy=%3d  azim=%6.1fdeg  elev=%5.1fdeg",
               dx, dy, math.degrees(_cs["azim"]), math.degrees(_cs["elev"]))
@@ -241,7 +255,7 @@ def do_pan(app, dx: int, dy: int) -> None:
 
     cam.Eye    = tg.CreatePoint(float(new_eye[0]),    float(new_eye[1]),    float(new_eye[2]))
     cam.Target = tg.CreatePoint(float(new_target[0]), float(new_target[1]), float(new_target[2]))
-    cam.Apply()
+    _apply_cam(cam)
 
     log.debug("pan dx=%3d dy=%3d", dx, dy)
 
@@ -317,6 +331,14 @@ def main() -> None:
             if app is None:
                 continue
 
+            # Safety cap: prevent runaway delta from stale-packet accumulation.
+            # At 125 Hz, one normal fast swipe is ~5–10 units; cap at 30.
+            MAX_DELTA = 30
+            orbit_dx = max(-MAX_DELTA, min(MAX_DELTA, orbit_dx))
+            orbit_dy = max(-MAX_DELTA, min(MAX_DELTA, orbit_dy))
+            pan_dx   = max(-MAX_DELTA, min(MAX_DELTA, pan_dx))
+            pan_dy   = max(-MAX_DELTA, min(MAX_DELTA, pan_dy))
+
             # Single camera update per frame
             try:
                 if orbit_dx or orbit_dy:
@@ -327,6 +349,20 @@ def main() -> None:
                 log.warning("Camera command failed: %s", exc)
                 app = None
                 _cs["valid"] = False
+
+            # Drain any packets that piled up while the COM call executed.
+            # Without this, the next frame inherits a stale backlog and produces
+            # a massive single-frame delta (the original "spin-out" bug).
+            sock.settimeout(0)
+            _drained = 0
+            try:
+                while True:
+                    sock.recvfrom(64)
+                    _drained += 1
+            except (BlockingIOError, socket.timeout):
+                pass
+            if _drained:
+                log.debug("drained %d stale UDP packets after COM call", _drained)
 
     except KeyboardInterrupt:
         log.info("Stopped.")

@@ -32,6 +32,10 @@ Orbit on bare TrackPoint movement; pan with center button held; zoom via scroll 
 - 2025-01: Python camera server with orbit + pan math
 - 2025-01: Auto-launch Python server from AHK; auto-kill on exit
 - 2025-01: SETUP.md with prerequisites, VID/PID instructions, sensitivity tuning
+- 2026-02: Fixed spin-out / packet-pileup bug (cam.Apply() blocking 1s)
+  - Added _apply_cam(): tries ApplyWithoutTransition() first, fallback to Apply()
+  - Added per-frame delta cap (MAX_DELTA=30) to prevent runaway accumulation
+  - Added non-blocking socket drain after each COM call to flush stale packets
 
 ## User Personas
 - Power CAD user with ThinkPad, no dedicated 3D mouse, familiar with AHK+Python
