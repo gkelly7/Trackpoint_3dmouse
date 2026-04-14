@@ -54,14 +54,14 @@ UDP_PORT = 9999
 
 # Radians added to azimuth/elevation per TrackPoint delta unit.
 # Increase for faster orbit.  Start here and tune with the log (azim/elev lines).
-ORBIT_SENSITIVITY = 0.04
+ORBIT_SENSITIVITY = 0.02
 
 # Fraction of eye-target distance added per TrackPoint delta unit for pan.
-PAN_SENSITIVITY = 0.008
+PAN_SENSITIVITY = 0.004
 
 # Inertia / coast factor applied when the TrackPoint stops moving.
 # 0.0 = stops instantly, 0.90 = long coast.  Applies to both orbit and pan.
-ORBIT_INERTIA = 0.80
+ORBIT_INERTIA = 0.65
 
 # After this many seconds of inactivity the server re-reads the camera from
 # Inventor so that scroll/ViewCube changes are picked up on the next orbit.

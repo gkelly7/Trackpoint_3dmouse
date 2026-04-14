@@ -15,6 +15,12 @@ global AHI := AutoHotInterception()
 global tpVid := 0x0000  ; UPDATE THIS: Your TrackPoint VID
 global tpPid := 0x0000  ; UPDATE THIS: Your TrackPoint PID
 
+; Dead zone for 3D orbit/pan in Inventor.
+; Packets where both |x| and |y| are below this value are ignored.
+; Lower = more sensitive (lightest touch responds).  0 = no filtering.
+; Higher = filters more drift.  Range 0-3, default 1.
+global tpDeadzone := 1
+
 global extVid := 0
 global extPid := 0
 global extId  := 0
@@ -338,7 +344,7 @@ OnTrackpointMove(x, y) {
     ; Dead zone: skip tiny drift events so TrackPoint drift
     ; does not flood Inventor with COM calls.
     if WinActive("ahk_exe Inventor.exe") {
-        if (Abs(x) < 2 && Abs(y) < 2)
+        if (Abs(x) <= tpDeadzone && Abs(y) <= tpDeadzone)
             return
         Send3DMove(x, y, isShiftDown ? 1 : 0)
         return
