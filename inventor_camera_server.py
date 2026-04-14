@@ -80,67 +80,35 @@ WORLD_UP = np.array([0.0, 1.0, 0.0])
 # Persistent camera state (avoids re-reading mid-animation camera position)
 # ---------------------------------------------------------------------------
 _cs = {           # camera state dict
-    "valid":   False,
-    "target":  None,   # np.array  -- pan target point
-    "r":       None,   # float     -- eye-to-target distance
-    "azim":    0.0,    # float rad -- horizontal orbit angle
-    "elev":    0.0,    # float rad -- vertical orbit angle
-    "last_t":  0.0,    # monotonic time of last write
+    "valid":  False,
+    "eye":    None,   # np.array(3) -- camera eye position
+    "target": None,   # np.array(3) -- orbit/pan target point
+    "up":     None,   # np.array(3) -- camera up unit vector
+    "r":      None,   # float       -- |eye - target| (used to scale pan)
+    "last_t": 0.0,    # monotonic time of last write
 }
 
 
-def _world_axes():
-    """Return (up, east, north) unit vectors for the current WORLD_UP."""
-    up  = WORLD_UP / np.linalg.norm(WORLD_UP)
-    ref = np.array([1., 0., 0.]) if abs(np.dot(up, [1., 0., 0.])) < 0.9 \
-          else np.array([0., 0., 1.])
-    east  = np.cross(up, ref);  east  /= np.linalg.norm(east)
-    north = np.cross(east, up)
-    return up, east, north
+def _rodrigues(v: np.ndarray, k: np.ndarray, theta: float) -> np.ndarray:
+    """Rotate vector v by angle theta (radians) around unit vector k."""
+    c = math.cos(theta)
+    s = math.sin(theta)
+    return v * c + np.cross(k, v) * s + k * (np.dot(k, v) * (1.0 - c))
 
 
 def _read_cam(cam):
-    """Decompose Inventor Camera into our (target, r, azim, elev) state."""
-    eye    = np.array([cam.Eye.X,    cam.Eye.Y,    cam.Eye.Z   ], dtype=float)
-    target = np.array([cam.Target.X, cam.Target.Y, cam.Target.Z], dtype=float)
-    offset = eye - target
-    r      = np.linalg.norm(offset)
-    if r < 1e-9:
+    """Read Inventor Camera into our state dict (eye, target, up, r)."""
+    eye    = np.array([cam.Eye.X,      cam.Eye.Y,      cam.Eye.Z     ], dtype=float)
+    target = np.array([cam.Target.X,   cam.Target.Y,   cam.Target.Z  ], dtype=float)
+    up_raw = np.array([cam.UpVector.X, cam.UpVector.Y, cam.UpVector.Z], dtype=float)
+    r      = np.linalg.norm(eye - target)
+    up_len = np.linalg.norm(up_raw)
+    if r < 1e-9 or up_len < 1e-9:
         return False
-
-    up, east, north = _world_axes()
-    elev = math.asin(np.clip(np.dot(offset / r, up), -1.0, 1.0))
-    proj     = offset - up * np.dot(offset, up)
-    proj_len = np.linalg.norm(proj)
-    azim     = math.atan2(np.dot(proj / proj_len, east),
-                          np.dot(proj / proj_len, north)) if proj_len > 1e-9 else 0.0
-
-    _cs.update(target=target.copy(), r=r, azim=azim, elev=elev,
-               valid=True, last_t=time.monotonic())
-    log.debug("resync  azim=%.1fdeg  elev=%.1fdeg  r=%.2f",
-              math.degrees(azim), math.degrees(elev), r)
+    _cs.update(eye=eye.copy(), target=target.copy(), up=up_raw / up_len,
+               r=r, valid=True, last_t=time.monotonic())
+    log.debug("resync  r=%.2f", r)
     return True
-
-
-def _eye_from_state():
-    """Reconstruct eye position from current _cs azim/elev/r/target."""
-    up, east, north = _world_axes()
-    cos_e = math.cos(_cs["elev"])
-    offset = _cs["r"] * (
-        up    * math.sin(_cs["elev"]) +
-        north * cos_e * math.cos(_cs["azim"]) +
-        east  * cos_e * math.sin(_cs["azim"])
-    )
-    return _cs["target"] + offset, offset
-
-
-def _up_from_eye(offset):
-    """Camera up vector: project WORLD_UP onto plane perpendicular to view."""
-    up   = WORLD_UP / np.linalg.norm(WORLD_UP)
-    nfwd = offset / np.linalg.norm(offset)
-    new_up = up - nfwd * np.dot(nfwd, up)
-    n = np.linalg.norm(new_up)
-    return new_up / n if n > 1e-9 else up
 
 
 # ---------------------------------------------------------------------------
@@ -168,17 +136,25 @@ def _active_view(app):
         return None
 
 
+_apply_cam_logged = False  # log the chosen method only once
+
+
 def _apply_cam(cam) -> None:
     """Apply camera without Inventor's blocking view-transition animation.
 
-    Inventor's cam.Apply() triggers a smooth fly-to animation that blocks
-    the calling thread for ~1 s, causing stale UDP packets to pile up.
-    ApplyWithoutTransition() is instant and non-blocking.
-    Falls back to Apply() for older Inventor builds that lack the method.
+    Tries ApplyWithoutTransition() (instant) first; falls back to Apply()
+    (runs a smooth ~1 s animation) for older Inventor builds.
     """
+    global _apply_cam_logged
     try:
         cam.ApplyWithoutTransition()
+        if not _apply_cam_logged:
+            log.info("Camera method: ApplyWithoutTransition() -- no animation lag")
+            _apply_cam_logged = True
     except Exception:
+        if not _apply_cam_logged:
+            log.info("Camera method: Apply() fallback -- ApplyWithoutTransition() unavailable")
+            _apply_cam_logged = True
         cam.Apply()
 
 
@@ -198,27 +174,45 @@ def do_orbit(app, dx: int, dy: int) -> None:
         if not _read_cam(cam):
             return
 
-    # Update our own state -- no re-reading from Inventor
-    # Negate dx so pushing right orbits to show the model's right side
-    _cs["azim"] -= dx * ORBIT_SENSITIVITY
-    _cs["elev"]  = float(np.clip(
-        _cs["elev"] + dy * ORBIT_SENSITIVITY,
-        -math.pi / 2 + 0.02,
-         math.pi / 2 - 0.02,
-    ))
+    offset   = _cs["eye"] - _cs["target"]
+    up       = _cs["up"].copy()
+    world_up = WORLD_UP / np.linalg.norm(WORLD_UP)
+
+    # Horizontal orbit: rotate around world up axis (turntable -- keeps model upright
+    # and always turns left/right relative to the current view)
+    if dx:
+        h_angle = -dx * ORBIT_SENSITIVITY
+        offset  = _rodrigues(offset, world_up, h_angle)
+        # Rotating around world-up does not change the camera up vector
+
+    # Vertical orbit: rotate around the camera's current right vector.
+    # This always tilts up/down relative to whatever you're looking at,
+    # regardless of how much you've already orbited horizontally.
+    # It also has no elevation clamp -- you can orbit freely over the top.
+    if dy:
+        fwd   = -offset / np.linalg.norm(offset)   # unit vector pointing toward target
+        right = np.cross(fwd, up)
+        rlen  = np.linalg.norm(right)
+        if rlen < 1e-9:                             # degenerate: fwd ≈ world up
+            right = np.cross(fwd, np.array([1., 0., 0.]))
+            rlen  = np.linalg.norm(right)
+        if rlen > 1e-9:
+            right   /= rlen
+            v_angle  = -dy * ORBIT_SENSITIVITY
+            offset   = _rodrigues(offset, right, v_angle)
+            up       = _rodrigues(up,     right, v_angle)
+            up      /= np.linalg.norm(up)
+
+    new_eye       = _cs["target"] + offset
+    _cs["eye"]    = new_eye
+    _cs["up"]     = up
     _cs["last_t"] = now
 
-    new_eye, offset = _eye_from_state()
-    new_up = _up_from_eye(offset)
-
-    cam.UpVector = tg.CreateUnitVector(
-        float(new_up[0]), float(new_up[1]), float(new_up[2]))
-    cam.Eye = tg.CreatePoint(
-        float(new_eye[0]), float(new_eye[1]), float(new_eye[2]))
+    cam.UpVector = tg.CreateUnitVector(float(up[0]),      float(up[1]),      float(up[2]))
+    cam.Eye      = tg.CreatePoint(     float(new_eye[0]), float(new_eye[1]), float(new_eye[2]))
     _apply_cam(cam)
 
-    log.debug("orbit dx=%3d dy=%3d  azim=%6.1fdeg  elev=%5.1fdeg",
-              dx, dy, math.degrees(_cs["azim"]), math.degrees(_cs["elev"]))
+    log.debug("orbit dx=%3d dy=%3d", dx, dy)
 
 
 def do_pan(app, dx: int, dy: int) -> None:
@@ -232,24 +226,27 @@ def do_pan(app, dx: int, dy: int) -> None:
         if not _read_cam(cam):
             return
 
-    # Build camera-right and camera-up from current eye direction
-    eye    = np.array([cam.Eye.X,    cam.Eye.Y,    cam.Eye.Z   ], dtype=float)
+    eye    = _cs["eye"]
     target = _cs["target"]
-    cam_up = np.array([cam.UpVector.X, cam.UpVector.Y, cam.UpVector.Z], dtype=float)
+    up     = _cs["up"]
 
     fwd   = (target - eye) / np.linalg.norm(target - eye)
-    right = np.cross(fwd, cam_up)
+    right = np.cross(fwd, up)
     r_len = np.linalg.norm(right)
     if r_len < 1e-9:
         return
     right /= r_len
 
-    scale  = _cs["r"] * PAN_SENSITIVITY
-    delta  = -right * (dx * scale) + cam_up * (-dy * scale)
+    scale = _cs["r"] * PAN_SENSITIVITY
+    # dx > 0 = trackpoint right → negate so camera pans right (model moves left)
+    # dy > 0 = trackpoint down  → positive up so camera pans down (model moves up)
+    #          (sign was previously negated, which reversed the direction)
+    delta = right * (-dx * scale) + up * (dy * scale)
 
     new_eye    = eye + delta
     new_target = target + delta
 
+    _cs["eye"]    = new_eye
     _cs["target"] = new_target
     _cs["last_t"] = now
 
@@ -361,8 +358,9 @@ def main() -> None:
                     _drained += 1
             except (BlockingIOError, socket.timeout):
                 pass
-            if _drained:
-                log.debug("drained %d stale UDP packets after COM call", _drained)
+            if _drained > 3:
+                log.debug("drained %d stale packets (COM call ~%d ms)",
+                          _drained, round(_drained * 8))
 
     except KeyboardInterrupt:
         log.info("Stopped.")
