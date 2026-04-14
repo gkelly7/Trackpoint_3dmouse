@@ -180,14 +180,14 @@ def do_orbit(app, dx: int, dy: int) -> None:
 
     offset   = _cs["eye"] - _cs["target"]
     up       = _cs["up"].copy()
-    world_up = WORLD_UP / np.linalg.norm(WORLD_UP)
 
-    # Horizontal orbit: rotate around world up axis (turntable -- keeps model upright
-    # and always turns left/right relative to the current view)
+    # Horizontal orbit: rotate around the camera's current up vector.
+    # This keeps left/right relative to what you currently see, even after
+    # vertical tilting (both axes are now fully camera-relative).
     if dx:
         h_angle = dx * ORBIT_SENSITIVITY
-        offset  = _rodrigues(offset, world_up, h_angle)
-        # Rotating around world-up does not change the camera up vector
+        offset  = _rodrigues(offset, up, h_angle)
+        # Rotating around the up vector leaves the up vector unchanged
 
     # Vertical orbit: rotate around the camera's current right vector.
     # This always tilts up/down relative to whatever you're looking at,
