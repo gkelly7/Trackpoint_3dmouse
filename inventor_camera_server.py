@@ -185,7 +185,7 @@ def do_orbit(app, dx: int, dy: int) -> None:
     # This keeps left/right relative to what you currently see, even after
     # vertical tilting (both axes are now fully camera-relative).
     if dx:
-        h_angle = dx * ORBIT_SENSITIVITY
+        h_angle = -dx * ORBIT_SENSITIVITY
         offset  = _rodrigues(offset, up, h_angle)
         # Rotating around the up vector leaves the up vector unchanged
 
