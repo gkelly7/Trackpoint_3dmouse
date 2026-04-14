@@ -59,6 +59,10 @@ ORBIT_SENSITIVITY = 0.04
 # Fraction of eye-target distance added per TrackPoint delta unit for pan.
 PAN_SENSITIVITY = 0.008
 
+# Inertia / coast factor applied when the TrackPoint stops moving.
+# 0.0 = stops instantly, 0.90 = long coast.  Applies to both orbit and pan.
+ORBIT_INERTIA = 0.80
+
 # After this many seconds of inactivity the server re-reads the camera from
 # Inventor so that scroll/ViewCube changes are picked up on the next orbit.
 RESYNC_IDLE = 0.6
@@ -181,7 +185,7 @@ def do_orbit(app, dx: int, dy: int) -> None:
     # Horizontal orbit: rotate around world up axis (turntable -- keeps model upright
     # and always turns left/right relative to the current view)
     if dx:
-        h_angle = -dx * ORBIT_SENSITIVITY
+        h_angle = dx * ORBIT_SENSITIVITY
         offset  = _rodrigues(offset, world_up, h_angle)
         # Rotating around world-up does not change the camera up vector
 
@@ -215,7 +219,7 @@ def do_orbit(app, dx: int, dy: int) -> None:
     log.debug("orbit dx=%3d dy=%3d", dx, dy)
 
 
-def do_pan(app, dx: int, dy: int) -> None:
+def do_pan(app, dx: float, dy: float) -> None:
     result = _active_view(app)
     if result is None:
         return
@@ -272,7 +276,13 @@ def main() -> None:
 
     app            = None
     last_reconnect = 0.0
-    FRAME_S        = 0.033   # 30 Hz max -- prevents flooding Inventors COM queue
+    FRAME_S        = 0.033   # 30 Hz -- rate-limits COM calls
+
+    # Running velocity (floats) that carry inertia between frames.
+    # Set directly from input when packets arrive; decayed by ORBIT_INERTIA otherwise.
+    vel_ox = vel_oy = 0.0   # orbit
+    vel_px = vel_py = 0.0   # pan
+    STOP   = 0.25           # velocity below this is snapped to zero
 
     try:
         while True:
@@ -288,9 +298,7 @@ def main() -> None:
                 else:
                     log.info("Waiting for Inventor to start...")
 
-            # Drain ALL pending UDP packets within one frame window,
-            # accumulating into a single orbit+pan delta.
-            # This caps cam.Apply() calls at 30/s regardless of TrackPoint rate.
+            # Accumulate raw input for one frame window.
             orbit_dx = orbit_dy = 0
             pan_dx   = pan_dy   = 0
             deadline = time.monotonic() + FRAME_S
@@ -313,8 +321,30 @@ def main() -> None:
                 else:
                     pan_dx   += x;  pan_dy   += y
 
-            # Ping Inventor if idle (detect crashes)
-            if app is not None and orbit_dx == 0 and orbit_dy == 0                     and pan_dx == 0 and pan_dy == 0:
+            # Safety cap: prevent runaway from any stale-packet accumulation.
+            MAX_DELTA = 30
+            orbit_dx = max(-MAX_DELTA, min(MAX_DELTA, orbit_dx))
+            orbit_dy = max(-MAX_DELTA, min(MAX_DELTA, orbit_dy))
+            pan_dx   = max(-MAX_DELTA, min(MAX_DELTA, pan_dx))
+            pan_dy   = max(-MAX_DELTA, min(MAX_DELTA, pan_dy))
+
+            # New input overrides velocity; no input decays it (inertia / coast).
+            if orbit_dx or orbit_dy:
+                vel_ox, vel_oy = float(orbit_dx), float(orbit_dy)
+            else:
+                vel_ox *= ORBIT_INERTIA;  vel_oy *= ORBIT_INERTIA
+                if abs(vel_ox) < STOP: vel_ox = 0.0
+                if abs(vel_oy) < STOP: vel_oy = 0.0
+
+            if pan_dx or pan_dy:
+                vel_px, vel_py = float(pan_dx), float(pan_dy)
+            else:
+                vel_px *= ORBIT_INERTIA;  vel_py *= ORBIT_INERTIA
+                if abs(vel_px) < STOP: vel_px = 0.0
+                if abs(vel_py) < STOP: vel_py = 0.0
+
+            # Ping Inventor when truly idle (motion fully stopped)
+            if app is not None and not (vel_ox or vel_oy or vel_px or vel_py):
                 if (time.monotonic() - last_reconnect) > RECONNECT_INTERVAL * 5:
                     last_reconnect = time.monotonic()
                     try:
@@ -328,28 +358,19 @@ def main() -> None:
             if app is None:
                 continue
 
-            # Safety cap: prevent runaway delta from stale-packet accumulation.
-            # At 125 Hz, one normal fast swipe is ~5–10 units; cap at 30.
-            MAX_DELTA = 30
-            orbit_dx = max(-MAX_DELTA, min(MAX_DELTA, orbit_dx))
-            orbit_dy = max(-MAX_DELTA, min(MAX_DELTA, orbit_dy))
-            pan_dx   = max(-MAX_DELTA, min(MAX_DELTA, pan_dx))
-            pan_dy   = max(-MAX_DELTA, min(MAX_DELTA, pan_dy))
-
-            # Single camera update per frame
+            # Apply camera
             try:
-                if orbit_dx or orbit_dy:
-                    do_orbit(app, orbit_dx, orbit_dy)
-                if pan_dx or pan_dy:
-                    do_pan(app, pan_dx, pan_dy)
+                if vel_ox or vel_oy:
+                    do_orbit(app, vel_ox, vel_oy)
+                if vel_px or vel_py:
+                    do_pan(app, vel_px, vel_py)
             except Exception as exc:
                 log.warning("Camera command failed: %s", exc)
                 app = None
                 _cs["valid"] = False
+                vel_ox = vel_oy = vel_px = vel_py = 0.0
 
-            # Drain any packets that piled up while the COM call executed.
-            # Without this, the next frame inherits a stale backlog and produces
-            # a massive single-frame delta (the original "spin-out" bug).
+            # Drain stale packets accumulated during the COM call.
             sock.settimeout(0)
             _drained = 0
             try:
