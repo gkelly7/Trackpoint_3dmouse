@@ -54,9 +54,10 @@ OnScriptExit(ExitReason, ExitCode) {
 }
 
 OnPowerEvent(wParam, lParam, msg, hwnd) {
-    global manualOverride
+    global manualOverride, isKidMode
     if (wParam == 0x0004) {
-        ToggleTrackpad(true)
+        if (!isKidMode)
+            ToggleTrackpad(true)
     }
     else if (wParam == 0x0007 || wParam == 0x0012) {
         manualOverride := true
@@ -65,9 +66,10 @@ OnPowerEvent(wParam, lParam, msg, hwnd) {
 }
 
 OnSessionChange(wParam, lParam, msg, hwnd) {
-    global manualOverride
+    global manualOverride, isKidMode
     if (wParam == 0x7) {
-        ToggleTrackpad(true)
+        if (!isKidMode)
+            ToggleTrackpad(true)
     }
     else if (wParam == 0x8) {
         manualOverride := true
@@ -130,7 +132,10 @@ SetTimer(CheckEnvironment, 1000)
 
 ; --- 4. ENVIRONMENT & STATE MANAGER ---
 CheckEnvironment() {
-    global manualOverride, wasMouseConnected
+    global manualOverride, wasMouseConnected, isKidMode
+
+    if (isKidMode)  ; never auto-switch modes while kids mode is active
+        return
 
     mouseConnected := CheckForExternalMouse()
 
@@ -147,7 +152,10 @@ CheckEnvironment() {
 
 ApplyMode() {
     global manualOverride, isSubscribed, extSubscribed, tpId, extId, extVid, extPid, AHI
-    global isDragging, activeDragButton, isShiftDown
+    global isDragging, activeDragButton, isShiftDown, isKidMode
+
+    if (isKidMode)  ; never modify mode state while kids mode is active
+        return
 
     if (manualOverride) {
         ; COUCH MODE
@@ -415,7 +423,7 @@ kidHook.KeyOpt("{Esc}", "E")
 kidHook.OnEnd := ExitKidMode
 
 ^!k:: {
-    global isKidMode, kidHook
+    global isKidMode, kidHook, isSubscribed, AHI, tpId
     if (isKidMode)
         return
 
@@ -423,7 +431,18 @@ kidHook.OnEnd := ExitKidMode
     ToolTip("KID MODE ACTIVE`nPress ESC to exit")
     SetTimer(() => ToolTip(), -3000)
 
-    ToggleTouchscreen(false)
+    ; If in couch mode the trackpoint is unsubscribed (passes through as a normal
+    ; mouse).  Re-subscribe with blocking so it cannot move the cursor in kids mode.
+    if (!isSubscribed) {
+        AHI.SubscribeMouseMoveRelative(tpId, true, OnTrackpointMove)
+        AHI.SubscribeMouseButton(tpId, 0, true, OnLeftBtn)
+        AHI.SubscribeMouseButton(tpId, 1, true, OnRightBtn)
+        AHI.SubscribeMouseButton(tpId, 2, true, OnCenterBtn)
+        isSubscribed := true
+    }
+
+    ToggleTrackpad(false)     ; always off in kids mode
+    ToggleTouchscreen(false)  ; always off; isTouchScreenOn unchanged so exit restores it
     kidHook.Start()
     TraySetIcon("kid.ico", 1, false)
 }
