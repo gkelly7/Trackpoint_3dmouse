@@ -96,6 +96,9 @@ global isDragging       := false
 global activeDragButton := ""
 global centerBtnDownTime := 0
 global escSuppressed    := false
+global isKidMode        := false
+global isTouchScreenOn  := false
+global isSpaceMouseMode := false
 
 ; ==================== 3D MOUSE: globals ====================
 global gUdpSocket  := 0
