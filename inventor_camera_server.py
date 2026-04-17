@@ -69,6 +69,19 @@ RESYNC_IDLE = 0.6
 
 RECONNECT_INTERVAL = 2.0   # seconds between Inventor reconnect attempts
 
+# Camera update rate in Hz.  Higher = smoother motion, more COM calls per second.
+# 30 Hz is safe if Inventor is using Apply() fallback (~96 ms per call).
+# If ApplyWithoutTransition() is available (check the log at startup), you can
+# raise this to 60 or even 90 for noticeably smoother movement.
+# Rule of thumb: keep FRAME_HZ < 1000 / <COM call duration in ms>.
+FRAME_HZ = 60
+
+# Input smoothing: exponential moving average applied to raw TrackPoint deltas.
+# 0.0 = no smoothing (raw, may feel jerky on hard surfaces).
+# 0.4 = light smoothing -- good starting point.
+# 0.7 = heavy smoothing (responsive but velvety; adds slight lag).
+INPUT_SMOOTH = 0.4
+
 # Inventor document type constants
 kPartDocumentObject     = 12290
 kAssemblyDocumentObject = 12291
@@ -286,7 +299,7 @@ def main() -> None:
 
     app            = None
     last_reconnect = 0.0
-    FRAME_S        = 0.033   # 30 Hz -- rate-limits COM calls
+    FRAME_S        = 1.0 / FRAME_HZ   # derived from config
 
     # Running velocity (floats) that carry inertia between frames.
     # Set directly from input when packets arrive; decayed by ORBIT_INERTIA otherwise.
@@ -338,16 +351,20 @@ def main() -> None:
             pan_dx   = max(-MAX_DELTA, min(MAX_DELTA, pan_dx))
             pan_dy   = max(-MAX_DELTA, min(MAX_DELTA, pan_dy))
 
-            # New input overrides velocity; no input decays it (inertia / coast).
+            # Blend new input into running velocity.
+            # INPUT_SMOOTH > 0 applies an EMA to soften jittery deltas;
+            # 0.0 = raw (fastest response), 0.7 = very smooth (slight lag).
             if orbit_dx or orbit_dy:
-                vel_ox, vel_oy = float(orbit_dx), float(orbit_dy)
+                vel_ox = vel_ox * INPUT_SMOOTH + float(orbit_dx) * (1.0 - INPUT_SMOOTH)
+                vel_oy = vel_oy * INPUT_SMOOTH + float(orbit_dy) * (1.0 - INPUT_SMOOTH)
             else:
                 vel_ox *= ORBIT_INERTIA;  vel_oy *= ORBIT_INERTIA
                 if abs(vel_ox) < STOP: vel_ox = 0.0
                 if abs(vel_oy) < STOP: vel_oy = 0.0
 
             if pan_dx or pan_dy:
-                vel_px, vel_py = float(pan_dx), float(pan_dy)
+                vel_px = vel_px * INPUT_SMOOTH + float(pan_dx) * (1.0 - INPUT_SMOOTH)
+                vel_py = vel_py * INPUT_SMOOTH + float(pan_dy) * (1.0 - INPUT_SMOOTH)
             else:
                 vel_px *= ORBIT_INERTIA;  vel_py *= ORBIT_INERTIA
                 if abs(vel_px) < STOP: vel_px = 0.0
