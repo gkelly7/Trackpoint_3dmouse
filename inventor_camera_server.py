@@ -72,6 +72,7 @@ RECONNECT_INTERVAL = 2.0   # seconds between Inventor reconnect attempts
 # Inventor document type constants
 kPartDocumentObject     = 12290
 kAssemblyDocumentObject = 12291
+kDrawingDocumentObject  = 12292
 
 # World-up axis for your Inventor templates.
 # Default Inventor part/assembly templates are Y-up.
@@ -131,7 +132,8 @@ def _active_view(app):
         doc = app.ActiveDocument
         if doc is None:
             return None
-        if doc.DocumentType not in (kPartDocumentObject, kAssemblyDocumentObject):
+        if doc.DocumentType not in (kPartDocumentObject, kAssemblyDocumentObject,
+                                    kDrawingDocumentObject):
             return None
         cam = doc.Views.Item(1).Camera
         return cam, app.TransientGeometry
