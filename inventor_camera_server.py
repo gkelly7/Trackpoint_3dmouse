@@ -167,11 +167,19 @@ def _apply_cam(cam) -> None:
 # ---------------------------------------------------------------------------
 # Orbit / Pan
 # ---------------------------------------------------------------------------
-def do_orbit(app, dx: int, dy: int) -> None:
+def do_orbit(app, dx: float, dy: float) -> None:
     result = _active_view(app)
     if result is None:
         return
     cam, tg = result
+
+    # Drawing documents are 2-D — orbit makes no sense; redirect to pan.
+    try:
+        if app.ActiveDocument.DocumentType == kDrawingDocumentObject:
+            do_pan(app, dx, dy)
+            return
+    except Exception:
+        pass
 
     now = time.monotonic()
 
