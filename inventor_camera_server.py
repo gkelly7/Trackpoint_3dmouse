@@ -57,16 +57,22 @@ UDP_PORT = 9999
 ORBIT_SENSITIVITY = 0.02
 
 # Fraction of eye-target distance added per TrackPoint delta unit for pan.
-PAN_SENSITIVITY = 0.004
+PAN_SENSITIVITY = 0.001
+
+# Flat pan sensitivity for drawing files (units per TrackPoint delta).
+# Drawing camera geometry is orthographic / differently scaled, so a fixed
+# value works better than the r-proportional scale used for 3D views.
+# Increase if panning feels too slow in drawings, decrease if too fast.
+DRAWING_PAN_SENSITIVITY = 0.5
 
 # Inertia / coast factor applied when the TrackPoint stops moving.
 # 0.0 = stops instantly, 0.90 = long coast.  Applies to both orbit and pan.
-ORBIT_INERTIA = 0.65
+ORBIT_INERTIA = 0.2
 
 # After this many seconds of inactivity the server re-reads the camera from
 # Inventor so that scroll/ViewCube changes are picked up on the next orbit.
 RESYNC_IDLE = 0.6
-
+ 
 RECONNECT_INTERVAL = 2.0   # seconds between Inventor reconnect attempts
 
 # Camera update rate in Hz.  Higher = smoother motion, more COM calls per second.
@@ -80,7 +86,7 @@ FRAME_HZ = 60
 # 0.0 = no smoothing (raw, may feel jerky on hard surfaces).
 # 0.4 = light smoothing -- good starting point.
 # 0.7 = heavy smoothing (responsive but velvety; adds slight lag).
-INPUT_SMOOTH = 0.4
+INPUT_SMOOTH = 0.5
 
 # Inventor document type constants
 kPartDocumentObject     = 12290
@@ -91,6 +97,7 @@ kDrawingDocumentObject  = 12292
 # Default Inventor part/assembly templates are Y-up.
 # Change to [0, 0, 1] if your models use Z-up.
 WORLD_UP = np.array([0.0, 1.0, 0.0])
+
 # ---------------------------------------------------------------------------
 
 
@@ -265,6 +272,11 @@ def do_pan(app, dx: float, dy: float) -> None:
     right /= r_len
 
     scale = _cs["r"] * PAN_SENSITIVITY
+    try:
+        if app.ActiveDocument.DocumentType == kDrawingDocumentObject:
+            scale = DRAWING_PAN_SENSITIVITY
+    except Exception:
+        pass
     # dx > 0 = trackpoint right → negate so camera pans right (model moves left)
     # dy > 0 = trackpoint down  → positive up so camera pans down (model moves up)
     #          (sign was previously negated, which reversed the direction)
