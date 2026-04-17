@@ -418,57 +418,31 @@ Send3DMove(x, y, mode) {
 ; ===================================================================
 
 OnTrackpointMove(x, y) {
-    global isDragging, activeDragButton, isShiftDown, isKidMode
+    global isShiftDown, isKidMode
     if (isKidMode)
         return
 
-    ; ==================== 3D MOUSE ====================
-    ; Dead zone: skip tiny drift events so TrackPoint drift
-    ; does not flood Inventor with COM calls.
     if WinActive("ahk_exe Inventor.exe") {
+        ; Dead zone: skip tiny drift so TrackPoint drift does not flood Inventor
         if (Abs(x) <= tpDeadzone && Abs(y) <= tpDeadzone)
             return
-        Send3DMove(x, y, isShiftDown ? 1 : 0)
+
+        ; Drawing files (.idw/.dwg) are 2-D: pan by default, orbit when centre held.
+        ; Part/assembly files: orbit by default, pan when centre held.
+        title := WinGetTitle("A")
+        isDrawing := InStr(title, ".idw") || InStr(title, ".dwg")
+        if (isDrawing)
+            Send3DMove(x, y, isShiftDown ? 0 : 1)  ; drawing: pan=default  orbit=centre
+        else
+            Send3DMove(x, y, isShiftDown ? 1 : 0)  ; model:   orbit=default pan=centre
         return
     }
-    ; ==================================================
 
-    if (!isDragging) {
-        if WinActive("ahk_exe orca-slicer.exe") {
-            if (isShiftDown) {
-                Send("{Shift Up}")
-                activeDragButton := "LButton"
-            } else {
-                activeDragButton := "RButton"
-            }
-        } else {
-            activeDragButton := "MButton"
-        }
-        Send("{" activeDragButton " Down}")
-        isDragging := true
-    }
-
+    ; Outside Inventor: pass movement through as normal cursor movement.
+    ; (Subscription is block=true so we must re-inject the delta manually.)
     DllCall("mouse_event", "UInt", 0x0001, "Int", x, "Int", y, "UInt", 0, "UPtr", 0)
-
-    if (isShiftDown) {
-        MouseGetPos(&mouseX, &mouseY)
-        if (mouseX < 50 || mouseX > A_ScreenWidth - 50 || mouseY < 50 || mouseY > A_ScreenHeight - 50) {
-            DllCall("SetCursorPos", "int", A_ScreenWidth/2, "int", A_ScreenHeight/2)
-        }
-    }
-    SetTimer(StopMovement, -100)
 }
 
-StopMovement() {
-    global isDragging, activeDragButton, isShiftDown
-    if (isDragging) {
-        Send("{" activeDragButton " Up}")
-        isDragging := false
-        if (WinActive("ahk_exe orca-slicer.exe") && isShiftDown) {
-            Send("{Shift Down}")
-        }
-    }
-}
 
 ; --- 10. TOUCHSCREEN MANAGER ---
 global isTouchScreenOn := false
