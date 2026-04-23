@@ -38,6 +38,11 @@ Orbit on bare TrackPoint movement; pan with center button held; zoom via scroll 
   - Removed hard elevation clamp -- full 360 degrees vertical now possible
 - 2026-02: Fixed pan up/down reversal (dy sign was negated, now positive)
 - 2026-02: _apply_cam() logs which method is used on first call
+- 2026-02: Removed 3D Mouse (SpaceMouse) mode entirely from AHK — only Desk/Couch/Kid modes remain
+- 2026-02: Multi-instance Inventor support in Python server
+  - _get_all_inventor_apps(): enumerates all Inventor instances via Windows ROT
+  - get_inventor(): matches foreground window PID to instance MainFrameHWND
+  - Main loop polls every INSTANCE_POLL_INTERVAL (1s) and auto-switches to focused instance
 
 ## User Personas
 - Power CAD user with ThinkPad, no dedicated 3D mouse, familiar with AHK+Python

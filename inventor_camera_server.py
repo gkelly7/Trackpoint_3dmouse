@@ -36,6 +36,8 @@ log = logging.getLogger(__name__)
 try:
     import pythoncom
     import win32com.client
+    import win32gui
+    import win32process
 except ImportError:
     log.error("pywin32 not installed.  Run:  pip install pywin32")
     sys.exit(1)
@@ -74,6 +76,7 @@ ORBIT_INERTIA = 0.2
 RESYNC_IDLE = 0.6
  
 RECONNECT_INTERVAL = 2.0   # seconds between Inventor reconnect attempts
+INSTANCE_POLL_INTERVAL = 1.0  # seconds between active-instance checks (multi-instance)
 
 # Camera update rate in Hz.  Higher = smoother motion, more COM calls per second.
 # 30 Hz is safe if Inventor is using Apply() fallback (~96 ms per call).
@@ -139,11 +142,65 @@ def _read_cam(cam):
 # ---------------------------------------------------------------------------
 # Inventor helpers
 # ---------------------------------------------------------------------------
-def get_inventor():
+def _get_all_inventor_apps():
+    """Enumerate every Inventor.Application instance from the Windows ROT.
+
+    Returns a list (possibly empty) of COM Application objects.
+    """
+    apps = []
     try:
-        return win32com.client.GetActiveObject("Inventor.Application")
+        ctx  = pythoncom.CreateBindCtx(0)
+        rot  = pythoncom.GetRunningObjectTable()
+        enum = rot.EnumRunning()
+        while True:
+            monikers = enum.Next(1)
+            if not monikers:
+                break
+            try:
+                name = monikers[0].GetDisplayName(ctx, None)
+                if "Inventor.Application" not in name:
+                    continue
+                disp = monikers[0].BindToObject(ctx, None, pythoncom.IID_IDispatch)
+                apps.append(win32com.client.Dispatch(disp))
+            except Exception:
+                pass
     except Exception:
-        return None
+        pass
+    return apps
+
+
+def get_inventor():
+    """Return the Inventor instance whose main window is in the foreground.
+
+    Scans the Windows Running Object Table for all Inventor instances, then
+    matches the foreground window's process ID to an instance's MainFrameHWND.
+    Falls back to the first available instance, or None if Inventor is not running.
+    """
+    apps = _get_all_inventor_apps()
+    if not apps:
+        # Legacy fallback: single-instance via GetActiveObject
+        try:
+            return win32com.client.GetActiveObject("Inventor.Application")
+        except Exception:
+            return None
+
+    # Try to find the instance whose main window is currently in the foreground
+    try:
+        fg_hwnd = win32gui.GetForegroundWindow()
+        if fg_hwnd:
+            _, fg_pid = win32process.GetWindowThreadProcessId(fg_hwnd)
+            for a in apps:
+                try:
+                    _, app_pid = win32process.GetWindowThreadProcessId(
+                        int(a.MainFrameHWND))
+                    if app_pid == fg_pid:
+                        return a
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return apps[0]  # fallback: first registered instance
 
 
 def _active_view(app):
@@ -309,9 +366,11 @@ def main() -> None:
     log.info("Orbit sensitivity: %.4f  Pan sensitivity: %.4f",
              ORBIT_SENSITIVITY, PAN_SENSITIVITY)
 
-    app            = None
-    last_reconnect = 0.0
-    FRAME_S        = 1.0 / FRAME_HZ   # derived from config
+    app                 = None
+    last_reconnect      = 0.0
+    last_instance_check = 0.0
+    cur_app_hwnd        = 0        # MainFrameHWND of current instance (instance tracking)
+    FRAME_S             = 1.0 / FRAME_HZ   # derived from config
 
     # Running velocity (floats) that carry inertia between frames.
     # Set directly from input when packets arrive; decayed by ORBIT_INERTIA otherwise.
@@ -329,9 +388,29 @@ def main() -> None:
                 _cs["valid"] = False
                 app = get_inventor()
                 if app:
-                    log.info("Connected to Inventor.")
+                    try:
+                        cur_app_hwnd = int(app.MainFrameHWND)
+                    except Exception:
+                        cur_app_hwnd = 0
+                    log.info("Connected to Inventor (HWND %d).", cur_app_hwnd)
                 else:
                     log.info("Waiting for Inventor to start...")
+
+            # Periodically switch to whichever Inventor window is in the foreground
+            if app is not None and (now - last_instance_check) >= INSTANCE_POLL_INTERVAL:
+                last_instance_check = now
+                candidate = get_inventor()
+                if candidate is not None:
+                    try:
+                        cand_hwnd = int(candidate.MainFrameHWND)
+                    except Exception:
+                        cand_hwnd = 0
+                    if cand_hwnd and cand_hwnd != cur_app_hwnd:
+                        log.info("Switched Inventor instance (HWND %d -> %d).",
+                                 cur_app_hwnd, cand_hwnd)
+                        app          = candidate
+                        cur_app_hwnd = cand_hwnd
+                        _cs["valid"] = False
 
             # Accumulate raw input for one frame window.
             orbit_dx = orbit_dy = 0

@@ -21,14 +21,6 @@ global tpPid := 0x0000  ; UPDATE THIS: Your TrackPoint PID
 ; Higher = filters more drift.  Range 0-3, default 1.
 global tpDeadzone := 1
 
-; 3Dconnexion SpaceMouse -- auto-switches between 3D TrackPoint and 3D Mouse modes.
-; VID 0x256F covers all modern 3Dconnexion devices.
-; Change smVid to 0x046D for pre-2010 devices; set smPid to a specific value
-; if you need to distinguish between multiple devices from the same vendor.
-global smVid            := 0x256F  ; 3Dconnexion USB vendor ID
-global smPid            := 0       ; 0 = match any PID from this vendor
-global isSpaceMouseMode := false
-
 global extVid := 0
 global extPid := 0
 global extId  := 0
@@ -47,7 +39,6 @@ OnMessage(0x02B1, OnSessionChange)
 
 OnScriptExit(ExitReason, ExitCode) {
     global gPythonPID, gUdpSocket
-    ; ==================== 3D MOUSE ====================
     if (gPythonPID != 0) {
         ProcessClose(gPythonPID)
         gPythonPID := 0
@@ -56,7 +47,6 @@ OnScriptExit(ExitReason, ExitCode) {
         DllCall("ws2_32\closesocket", "Ptr", gUdpSocket)
         DllCall("ws2_32\WSACleanup")
     }
-    ; ==================================================
     ToggleTrackpad(true)
     ToggleTouchscreen(true)
 }
@@ -98,9 +88,7 @@ global centerBtnDownTime := 0
 global escSuppressed    := false
 global isKidMode        := false
 global isTouchScreenOn  := false
-global isSpaceMouseMode := false
-
-; ==================== 3D MOUSE: globals ====================
+; --- UDP socket globals ---
 global gUdpSocket  := 0
 global gSockAddr   := 0
 global gPythonPID  := 0
@@ -137,13 +125,12 @@ if FileExist(_pyScript) {
         "3D Mouse: missing file", "Icon!"
     )
 }
-; ===========================================================
 
 SetTimer(CheckEnvironment, 1000)
 
 ; --- 4. ENVIRONMENT & STATE MANAGER ---
 CheckEnvironment() {
-    global manualOverride, wasMouseConnected, isKidMode, isSpaceMouseMode
+    global manualOverride, wasMouseConnected, isKidMode
 
     if (isKidMode)  ; never auto-switch modes while kids mode is active
         return
@@ -159,58 +146,16 @@ CheckEnvironment() {
     }
 
     wasMouseConnected := mouseConnected
-
-    ; SpaceMouse auto-detection: switches to 3D Mouse mode when SpaceMouse is present
-    ; (only from 3D TrackPoint mode -- couch/kids modes are unaffected).
-    spaceMouseNow := CheckForSpaceMouse()
-    if (spaceMouseNow && !manualOverride && !isSpaceMouseMode) {
-        isSpaceMouseMode := true
-        ApplyMode()
-    } else if (!spaceMouseNow && isSpaceMouseMode) {
-        isSpaceMouseMode := false
-        ApplyMode()
-    }
 }
 
 ApplyMode() {
     global manualOverride, isSubscribed, extSubscribed, tpId, extId, extVid, extPid, AHI
-    global isDragging, activeDragButton, isShiftDown, isKidMode, isSpaceMouseMode
+    global isDragging, activeDragButton, isShiftDown, isKidMode
 
     if (isKidMode)  ; never modify mode state while kids mode is active
         return
 
-    if (isSpaceMouseMode) {
-        ; 3D MOUSE MODE -- SpaceMouse handles navigation; TrackPoint and trackpad are normal
-        ToggleTrackpad(true)
-
-        if (isSubscribed) {
-            AHI.UnsubscribeMouseMoveRelative(tpId)
-            AHI.UnsubscribeMouseButton(tpId, 0)
-            AHI.UnsubscribeMouseButton(tpId, 1)
-            AHI.UnsubscribeMouseButton(tpId, 2)
-            isSubscribed := false
-
-            if (isDragging && activeDragButton != "") {
-                Send("{" activeDragButton " Up}")
-                isDragging := false
-            }
-            if (isShiftDown) {
-                Send("{Shift Up}")
-                isShiftDown := false
-            }
-        }
-
-        if (extId && extSubscribed) {
-            AHI.UnsubscribeMouseMoveRelative(extId)
-            AHI.UnsubscribeMouseButton(extId, 0)
-            extSubscribed := false
-        }
-
-        ToolTip("3D Mouse Mode: SpaceMouse active, TrackPoint normal")
-        SetTimer(() => ToolTip(), -2000)
-        TraySetIcon("3d.ico", 1, false)
-
-    } else if (manualOverride) {
+    if (manualOverride) {
         ; COUCH MODE
         ToggleTrackpad(true)
 
@@ -293,25 +238,6 @@ CheckForExternalMouse() {
     return false
 }
 
-; --- 5b. SPACEMOUSE DETECTOR ---
-CheckForSpaceMouse() {
-    global smVid, smPid
-    try {
-        wmi   := ComObjGet("winmgmts:")
-        ; Win32_PnPEntity covers SpaceMouse (not a Win32_PointingDevice)
-        query := wmi.ExecQuery("SELECT * FROM Win32_PnPEntity WHERE PNPDeviceID LIKE 'HID%'")
-        for device in query {
-            id := device.PNPDeviceID
-            if RegExMatch(id, "i)VID[_\&]([0-9A-F]{4}).*PID[_\&]([0-9A-F]{4})", &m) {
-                vid := Integer("0x" . m[1])
-                pid := Integer("0x" . m[2])
-                if (vid == smVid && (smPid == 0 || pid == smPid))
-                    return true
-            }
-        }
-    }
-    return false
-}
 
 ; --- 6. TRACKPAD MASTER SWITCH ---
 ToggleTrackpad(state) {
@@ -341,14 +267,13 @@ OnExtMouseWakeBtn(state) {
 
 ; --- 8. BUTTON REMAPS & OVERRIDE ---
 OnLeftBtn(state) {
-    global isShiftDown, manualOverride, escSuppressed, isKidMode, isSpaceMouseMode
+    global isShiftDown, manualOverride, escSuppressed, isKidMode
     if (isKidMode)
         return
     if (state) {
         if (isShiftDown) {
             escSuppressed := true
             manualOverride := !manualOverride
-            isSpaceMouseMode := false  ; manual override exits SpaceMouse auto-mode
             ApplyMode()
             return
         }
@@ -373,9 +298,8 @@ OnRightBtn(state) {
     }
 }
 
-; ==================== 3D MOUSE: modified OnCenterBtn ====================
-; When Inventor is active, suppress Shift and Home so they don't interfere
-; with the 3D orbit.  isShiftDown still acts as the pan-mode flag.
+; Center button: suppress Shift/Home when Inventor is active so they don't
+; interfere with the 3D orbit.  isShiftDown still acts as the pan-mode flag.
 OnCenterBtn(state) {
     global isShiftDown, centerBtnDownTime, isKidMode
     if (isKidMode)
@@ -396,11 +320,9 @@ OnCenterBtn(state) {
         }
     }
 }
-; ========================================================================
 
 ; --- 9. MOVEMENT LOGIC ---
 
-; ==================== 3D MOUSE: UDP send helper ====================
 Send3DMove(x, y, mode) {
     global gUdpSocket, gSockAddr
     data := Buffer(9)
@@ -415,7 +337,6 @@ Send3DMove(x, y, mode) {
         "Ptr",  gSockAddr,
         "Int",  16)
 }
-; ===================================================================
 
 OnTrackpointMove(x, y) {
     global isShiftDown, isKidMode
