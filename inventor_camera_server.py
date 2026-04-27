@@ -152,6 +152,38 @@ def _read_cam(cam):
 # ---------------------------------------------------------------------------
 # Inventor helpers
 # ---------------------------------------------------------------------------
+PROCESS_QUERY_LIMITED_INFO = 0x1000  # for QueryFullProcessImageNameW
+
+
+def _hwnd_to_inventor_pid(hwnd):
+    """Return the PID if hwnd belongs to Inventor.exe, otherwise 0.
+
+    Uses ctypes / kernel32 directly; no pywin32 modules required.
+    """
+    try:
+        pid_buf = ctypes.c_ulong(0)
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_buf))
+        pid = pid_buf.value
+        if not pid:
+            return 0
+        h = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFO, False, pid)
+        if not h:
+            return 0
+        try:
+            buf  = ctypes.create_unicode_buffer(260)
+            size = ctypes.c_ulong(260)
+            ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(
+                h, 0, buf, ctypes.byref(size))
+            if ok and buf.value.lower().endswith("inventor.exe"):
+                return pid
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+    except Exception:
+        pass
+    return 0
+
+
 # CLSID for "Inventor.Application" -- resolved once at startup so the
 # ROT scan can match by CLSID (class-moniker names look like
 # "clsid:{XXXXXXXX-...}", not like the ProgID string).
@@ -399,7 +431,8 @@ def main() -> None:
     app                 = None
     last_reconnect      = 0.0
     last_instance_check = time.monotonic()  # defer first poll by INSTANCE_POLL_INTERVAL
-    cur_app_hwnd        = 0        # MainFrameHWND of current instance (instance tracking)
+    cur_app_hwnd        = 0        # MainFrameHWND of current instance
+    cur_app_pid         = 0        # PID of current instance (for multi-instance switch)
     FRAME_S             = 1.0 / FRAME_HZ   # derived from config
 
     # Running velocity (floats) that carry inertia between frames.
@@ -425,7 +458,14 @@ def main() -> None:
                             cur_app_hwnd = int(app.MainFrameHWND)
                         except Exception:
                             cur_app_hwnd = 0
-                        log.info("Connected to Inventor (HWND %d).", cur_app_hwnd)
+                        # Resolve PID so instance poll can detect a focus switch
+                        if cur_app_hwnd:
+                            _pid_buf = ctypes.c_ulong(0)
+                            _user32.GetWindowThreadProcessId(
+                                cur_app_hwnd, ctypes.byref(_pid_buf))
+                            cur_app_pid = _pid_buf.value
+                        log.info("Connected to Inventor (HWND %d, PID %d).",
+                                 cur_app_hwnd, cur_app_pid)
                     else:
                         log.info("Waiting for Inventor to start...")
 
@@ -436,22 +476,18 @@ def main() -> None:
                              "connected" if app is not None else "disconnected",
                              vel_ox, vel_oy, vel_px, vel_py)
 
-                # Periodically switch to whichever Inventor window is in the foreground
+                # Multi-instance: if a DIFFERENT Inventor.exe is now in the
+                # foreground, force reconnect so GetActiveObject can return it.
                 if app is not None and (now - last_instance_check) >= INSTANCE_POLL_INTERVAL:
                     last_instance_check = now
                     try:
-                        candidate = get_inventor()
-                        if candidate is not None:
-                            try:
-                                cand_hwnd = int(candidate.MainFrameHWND)
-                            except Exception:
-                                cand_hwnd = 0
-                            if cand_hwnd and cand_hwnd != cur_app_hwnd:
-                                log.info("Switched Inventor instance (HWND %d -> %d).",
-                                         cur_app_hwnd, cand_hwnd)
-                                app          = candidate
-                                cur_app_hwnd = cand_hwnd
-                                _cs["valid"] = False
+                        fg_hwnd    = _user32.GetForegroundWindow()
+                        fg_inv_pid = _hwnd_to_inventor_pid(fg_hwnd) if fg_hwnd else 0
+                        if fg_inv_pid and fg_inv_pid != cur_app_pid:
+                            log.info("Foreground Inventor changed (PID %d -> %d). "
+                                     "Reconnecting...", cur_app_pid, fg_inv_pid)
+                            app = None           # triggers reconnect on next iteration
+                            last_reconnect = 0   # reconnect immediately, don't wait
                     except Exception as _ie:
                         log.warning("Instance poll error (non-fatal): %s", _ie)
 

@@ -43,6 +43,9 @@ Orbit on bare TrackPoint movement; pan with center button held; zoom via scroll 
   - _get_all_inventor_apps(): enumerates all Inventor instances via Windows ROT
   - get_inventor(): matches foreground window PID to instance MainFrameHWND
   - Main loop polls every INSTANCE_POLL_INTERVAL (1s) and auto-switches to focused instance
+  - last_reconnect reset to 0 on instance switch so reconnect is immediate (no 2s delay)
+- 2026-02: AppSwitcher AHK helper provided (InventorMainWindows + CycleInventorInstances)
+  - Filters Inventor sub-windows via: no owner + non-empty title + "Inventor" in title
 
 ## User Personas
 - Power CAD user with ThinkPad, no dedicated 3D mouse, familiar with AHK+Python
