@@ -33,14 +33,24 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+
+def _log_unhandled_exception(exc_type, exc_value, exc_tb):
+    """Catch all unhandled exceptions and write them to the log file."""
+    log.critical("UNHANDLED EXCEPTION", exc_info=(exc_type, exc_value, exc_tb))
+
+sys.excepthook = _log_unhandled_exception
+
 try:
     import pythoncom
     import win32com.client
-    import win32gui
-    import win32process
 except ImportError:
     log.error("pywin32 not installed.  Run:  pip install pywin32")
     sys.exit(1)
+
+# Use ctypes directly for foreground-window detection (no extra pywin32 modules needed)
+import ctypes
+import ctypes.wintypes
+_user32 = ctypes.windll.user32
 
 try:
     import numpy as np
@@ -142,11 +152,26 @@ def _read_cam(cam):
 # ---------------------------------------------------------------------------
 # Inventor helpers
 # ---------------------------------------------------------------------------
+# CLSID for "Inventor.Application" -- resolved once at startup so the
+# ROT scan can match by CLSID (class-moniker names look like
+# "clsid:{XXXXXXXX-...}", not like the ProgID string).
+try:
+    _INV_CLSID = str(pythoncom.CLSIDFromProgID("Inventor.Application")).lower()
+except Exception:
+    _INV_CLSID = None  # Inventor not installed on this machine
+
+
 def _get_all_inventor_apps():
     """Enumerate every Inventor.Application instance from the Windows ROT.
 
+    Windows registers COM objects under their CLSID (e.g. "clsid:{...}"),
+    not under the human-readable ProgID.  We resolve the CLSID once at
+    import time and use it to filter ROT entries.
+
     Returns a list (possibly empty) of COM Application objects.
     """
+    if not _INV_CLSID:
+        return []
     apps = []
     try:
         ctx  = pythoncom.CreateBindCtx(0)
@@ -157,11 +182,11 @@ def _get_all_inventor_apps():
             if not monikers:
                 break
             try:
-                name = monikers[0].GetDisplayName(ctx, None)
-                if "Inventor.Application" not in name:
+                name = monikers[0].GetDisplayName(ctx, None).lower()
+                if _INV_CLSID not in name:
                     continue
-                disp = monikers[0].BindToObject(ctx, None, pythoncom.IID_IDispatch)
-                apps.append(win32com.client.Dispatch(disp))
+                obj = rot.GetObject(monikers[0])  # safer than BindToObject
+                apps.append(win32com.client.Dispatch(obj))
             except Exception:
                 pass
     except Exception:
@@ -184,16 +209,21 @@ def get_inventor():
         except Exception:
             return None
 
-    # Try to find the instance whose main window is currently in the foreground
+    # Try to find the instance whose main window is currently in the foreground.
+    # Use ctypes directly to avoid any pywin32 DLL-load side-effects.
     try:
-        fg_hwnd = win32gui.GetForegroundWindow()
+        fg_hwnd = _user32.GetForegroundWindow()
         if fg_hwnd:
-            _, fg_pid = win32process.GetWindowThreadProcessId(fg_hwnd)
+            fg_pid = ctypes.c_ulong(0)
+            _user32.GetWindowThreadProcessId(fg_hwnd, ctypes.byref(fg_pid))
             for a in apps:
                 try:
-                    _, app_pid = win32process.GetWindowThreadProcessId(
-                        int(a.MainFrameHWND))
-                    if app_pid == fg_pid:
+                    inv_hwnd = int(a.MainFrameHWND)
+                    if not inv_hwnd:
+                        continue
+                    inv_pid = ctypes.c_ulong(0)
+                    _user32.GetWindowThreadProcessId(inv_hwnd, ctypes.byref(inv_pid))
+                    if inv_pid.value == fg_pid.value:
                         return a
                 except Exception:
                     pass
@@ -368,7 +398,7 @@ def main() -> None:
 
     app                 = None
     last_reconnect      = 0.0
-    last_instance_check = 0.0
+    last_instance_check = time.monotonic()  # defer first poll by INSTANCE_POLL_INTERVAL
     cur_app_hwnd        = 0        # MainFrameHWND of current instance (instance tracking)
     FRAME_S             = 1.0 / FRAME_HZ   # derived from config
 
@@ -377,130 +407,149 @@ def main() -> None:
     vel_ox = vel_oy = 0.0   # orbit
     vel_px = vel_py = 0.0   # pan
     STOP   = 0.25           # velocity below this is snapped to zero
+    _heartbeat_t = 0.0
+    HEARTBEAT_S  = 5.0      # log "alive" every this many seconds
 
     try:
         while True:
-            now = time.monotonic()
-
-            # Reconnect to Inventor if not connected
-            if app is None and (now - last_reconnect) >= RECONNECT_INTERVAL:
-                last_reconnect = now
-                _cs["valid"] = False
-                app = get_inventor()
-                if app:
-                    try:
-                        cur_app_hwnd = int(app.MainFrameHWND)
-                    except Exception:
-                        cur_app_hwnd = 0
-                    log.info("Connected to Inventor (HWND %d).", cur_app_hwnd)
-                else:
-                    log.info("Waiting for Inventor to start...")
-
-            # Periodically switch to whichever Inventor window is in the foreground
-            if app is not None and (now - last_instance_check) >= INSTANCE_POLL_INTERVAL:
-                last_instance_check = now
-                candidate = get_inventor()
-                if candidate is not None:
-                    try:
-                        cand_hwnd = int(candidate.MainFrameHWND)
-                    except Exception:
-                        cand_hwnd = 0
-                    if cand_hwnd and cand_hwnd != cur_app_hwnd:
-                        log.info("Switched Inventor instance (HWND %d -> %d).",
-                                 cur_app_hwnd, cand_hwnd)
-                        app          = candidate
-                        cur_app_hwnd = cand_hwnd
-                        _cs["valid"] = False
-
-            # Accumulate raw input for one frame window.
-            orbit_dx = orbit_dy = 0
-            pan_dx   = pan_dy   = 0
-            deadline = time.monotonic() + FRAME_S
-
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                sock.settimeout(max(remaining, 0.001))
-                try:
-                    data, _ = sock.recvfrom(64)
-                except socket.timeout:
-                    break
-                if len(data) < 9:
-                    continue
-                x, y = struct.unpack_from("<ii", data, 0)
-                mode = struct.unpack_from("<B",  data, 8)[0]
-                if mode == 0:
-                    orbit_dx += x;  orbit_dy += y
-                else:
-                    pan_dx   += x;  pan_dy   += y
-
-            # Safety cap: prevent runaway from any stale-packet accumulation.
-            MAX_DELTA = 30
-            orbit_dx = max(-MAX_DELTA, min(MAX_DELTA, orbit_dx))
-            orbit_dy = max(-MAX_DELTA, min(MAX_DELTA, orbit_dy))
-            pan_dx   = max(-MAX_DELTA, min(MAX_DELTA, pan_dx))
-            pan_dy   = max(-MAX_DELTA, min(MAX_DELTA, pan_dy))
-
-            # Blend new input into running velocity.
-            # INPUT_SMOOTH > 0 applies an EMA to soften jittery deltas;
-            # 0.0 = raw (fastest response), 0.7 = very smooth (slight lag).
-            if orbit_dx or orbit_dy:
-                vel_ox = vel_ox * INPUT_SMOOTH + float(orbit_dx) * (1.0 - INPUT_SMOOTH)
-                vel_oy = vel_oy * INPUT_SMOOTH + float(orbit_dy) * (1.0 - INPUT_SMOOTH)
-            else:
-                vel_ox *= ORBIT_INERTIA;  vel_oy *= ORBIT_INERTIA
-                if abs(vel_ox) < STOP: vel_ox = 0.0
-                if abs(vel_oy) < STOP: vel_oy = 0.0
-
-            if pan_dx or pan_dy:
-                vel_px = vel_px * INPUT_SMOOTH + float(pan_dx) * (1.0 - INPUT_SMOOTH)
-                vel_py = vel_py * INPUT_SMOOTH + float(pan_dy) * (1.0 - INPUT_SMOOTH)
-            else:
-                vel_px *= ORBIT_INERTIA;  vel_py *= ORBIT_INERTIA
-                if abs(vel_px) < STOP: vel_px = 0.0
-                if abs(vel_py) < STOP: vel_py = 0.0
-
-            # Ping Inventor when truly idle (motion fully stopped)
-            if app is not None and not (vel_ox or vel_oy or vel_px or vel_py):
-                if (time.monotonic() - last_reconnect) > RECONNECT_INTERVAL * 5:
-                    last_reconnect = time.monotonic()
-                    try:
-                        _ = app.Caption
-                    except Exception:
-                        log.info("Lost connection to Inventor.")
-                        app = None
-                        _cs["valid"] = False
-                continue
-
-            if app is None:
-                continue
-
-            # Apply camera
             try:
-                if vel_ox or vel_oy:
-                    do_orbit(app, vel_ox, vel_oy)
-                if vel_px or vel_py:
-                    do_pan(app, vel_px, vel_py)
-            except Exception as exc:
-                log.warning("Camera command failed: %s", exc)
+                now = time.monotonic()
+
+                # Reconnect to Inventor if not connected
+                if app is None and (now - last_reconnect) >= RECONNECT_INTERVAL:
+                    last_reconnect = now
+                    _cs["valid"] = False
+                    app = get_inventor()
+                    if app:
+                        try:
+                            cur_app_hwnd = int(app.MainFrameHWND)
+                        except Exception:
+                            cur_app_hwnd = 0
+                        log.info("Connected to Inventor (HWND %d).", cur_app_hwnd)
+                    else:
+                        log.info("Waiting for Inventor to start...")
+
+                # Heartbeat: log every HEARTBEAT_S seconds to confirm the server is alive
+                if (now - _heartbeat_t) >= HEARTBEAT_S:
+                    _heartbeat_t = now
+                    log.info("alive  app=%s  vel=(%.2f,%.2f,%.2f,%.2f)",
+                             "connected" if app is not None else "disconnected",
+                             vel_ox, vel_oy, vel_px, vel_py)
+
+                # Periodically switch to whichever Inventor window is in the foreground
+                if app is not None and (now - last_instance_check) >= INSTANCE_POLL_INTERVAL:
+                    last_instance_check = now
+                    try:
+                        candidate = get_inventor()
+                        if candidate is not None:
+                            try:
+                                cand_hwnd = int(candidate.MainFrameHWND)
+                            except Exception:
+                                cand_hwnd = 0
+                            if cand_hwnd and cand_hwnd != cur_app_hwnd:
+                                log.info("Switched Inventor instance (HWND %d -> %d).",
+                                         cur_app_hwnd, cand_hwnd)
+                                app          = candidate
+                                cur_app_hwnd = cand_hwnd
+                                _cs["valid"] = False
+                    except Exception as _ie:
+                        log.warning("Instance poll error (non-fatal): %s", _ie)
+
+                # Accumulate raw input for one frame window.
+                orbit_dx = orbit_dy = 0
+                pan_dx   = pan_dy   = 0
+                deadline = time.monotonic() + FRAME_S
+
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    sock.settimeout(max(remaining, 0.001))
+                    try:
+                        data, _ = sock.recvfrom(64)
+                    except socket.timeout:
+                        break
+                    if len(data) < 9:
+                        continue
+                    x, y = struct.unpack_from("<ii", data, 0)
+                    mode = struct.unpack_from("<B",  data, 8)[0]
+                    log.debug("pkt  mode=%d x=%+d y=%+d", mode, x, y)
+                    if mode == 0:
+                        orbit_dx += x;  orbit_dy += y
+                    else:
+                        pan_dx   += x;  pan_dy   += y
+
+                # Safety cap: prevent runaway from any stale-packet accumulation.
+                MAX_DELTA = 30
+                orbit_dx = max(-MAX_DELTA, min(MAX_DELTA, orbit_dx))
+                orbit_dy = max(-MAX_DELTA, min(MAX_DELTA, orbit_dy))
+                pan_dx   = max(-MAX_DELTA, min(MAX_DELTA, pan_dx))
+                pan_dy   = max(-MAX_DELTA, min(MAX_DELTA, pan_dy))
+
+                # Blend new input into running velocity.
+                # INPUT_SMOOTH > 0 applies an EMA to soften jittery deltas;
+                # 0.0 = raw (fastest response), 0.7 = very smooth (slight lag).
+                if orbit_dx or orbit_dy:
+                    vel_ox = vel_ox * INPUT_SMOOTH + float(orbit_dx) * (1.0 - INPUT_SMOOTH)
+                    vel_oy = vel_oy * INPUT_SMOOTH + float(orbit_dy) * (1.0 - INPUT_SMOOTH)
+                else:
+                    vel_ox *= ORBIT_INERTIA;  vel_oy *= ORBIT_INERTIA
+                    if abs(vel_ox) < STOP: vel_ox = 0.0
+                    if abs(vel_oy) < STOP: vel_oy = 0.0
+
+                if pan_dx or pan_dy:
+                    vel_px = vel_px * INPUT_SMOOTH + float(pan_dx) * (1.0 - INPUT_SMOOTH)
+                    vel_py = vel_py * INPUT_SMOOTH + float(pan_dy) * (1.0 - INPUT_SMOOTH)
+                else:
+                    vel_px *= ORBIT_INERTIA;  vel_py *= ORBIT_INERTIA
+                    if abs(vel_px) < STOP: vel_px = 0.0
+                    if abs(vel_py) < STOP: vel_py = 0.0
+
+                # Ping Inventor when truly idle (motion fully stopped)
+                if app is not None and not (vel_ox or vel_oy or vel_px or vel_py):
+                    if (time.monotonic() - last_reconnect) > RECONNECT_INTERVAL * 5:
+                        last_reconnect = time.monotonic()
+                        try:
+                            _ = app.Caption
+                        except Exception:
+                            log.info("Lost connection to Inventor.")
+                            app = None
+                            _cs["valid"] = False
+                    continue
+
+                if app is None:
+                    continue
+
+                # Apply camera
+                try:
+                    if vel_ox or vel_oy:
+                        do_orbit(app, vel_ox, vel_oy)
+                    if vel_px or vel_py:
+                        do_pan(app, vel_px, vel_py)
+                except Exception as exc:
+                    log.warning("Camera command failed: %s", exc)
+                    app = None
+                    _cs["valid"] = False
+                    vel_ox = vel_oy = vel_px = vel_py = 0.0
+
+                # Drain stale packets accumulated during the COM call.
+                sock.settimeout(0)
+                _drained = 0
+                try:
+                    while True:
+                        sock.recvfrom(64)
+                        _drained += 1
+                except (BlockingIOError, socket.timeout):
+                    pass
+                if _drained > 3:
+                    log.debug("drained %d stale packets (COM call ~%d ms)",
+                              _drained, round(_drained * 8))
+
+            except Exception as _loop_exc:
+                log.exception("Unhandled error in main loop (will retry): %s", _loop_exc)
                 app = None
                 _cs["valid"] = False
-                vel_ox = vel_oy = vel_px = vel_py = 0.0
-
-            # Drain stale packets accumulated during the COM call.
-            sock.settimeout(0)
-            _drained = 0
-            try:
-                while True:
-                    sock.recvfrom(64)
-                    _drained += 1
-            except (BlockingIOError, socket.timeout):
-                pass
-            if _drained > 3:
-                log.debug("drained %d stale packets (COM call ~%d ms)",
-                          _drained, round(_drained * 8))
-
+                time.sleep(1.0)
     except KeyboardInterrupt:
         log.info("Stopped.")
     finally:
