@@ -200,29 +200,43 @@ def _get_all_inventor_apps():
     not under the human-readable ProgID.  We resolve the CLSID once at
     import time and use it to filter ROT entries.
 
+    NOTE: The Python process must run at the SAME integrity level as Inventor
+    (typically medium / non-elevated).  If Python runs elevated and Inventor
+    does not, the ROT is isolated and this function will return an empty list.
+    See the AHK script for the fix (Shell.Application non-elevated launch).
+
     Returns a list (possibly empty) of COM Application objects.
     """
     if not _INV_CLSID:
+        log.warning("ROT scan skipped: Inventor.Application CLSID not found in registry")
         return []
     apps = []
     try:
         ctx  = pythoncom.CreateBindCtx(0)
         rot  = pythoncom.GetRunningObjectTable()
         enum = rot.EnumRunning()
+        all_names = []
         while True:
             monikers = enum.Next(1)
             if not monikers:
                 break
             try:
                 name = monikers[0].GetDisplayName(ctx, None).lower()
+                all_names.append(name)
                 if _INV_CLSID not in name:
                     continue
-                obj = rot.GetObject(monikers[0])  # safer than BindToObject
+                obj = rot.GetObject(monikers[0])
                 apps.append(win32com.client.Dispatch(obj))
-            except Exception:
-                pass
-    except Exception:
-        pass
+                log.debug("ROT: matched Inventor entry: %s", name)
+            except Exception as e:
+                log.debug("ROT entry error: %s", e)
+        if not apps:
+            log.debug("ROT: %d total entries, none matched CLSID %s",
+                      len(all_names), _INV_CLSID)
+            for n in all_names[:12]:
+                log.debug("  ROT: %s", n)
+    except Exception as e:
+        log.warning("ROT scan exception: %s", e)
     return apps
 
 
@@ -232,13 +246,17 @@ def get_inventor():
     Scans the Windows Running Object Table for all Inventor instances, then
     matches the foreground window's process ID to an instance's MainFrameHWND.
     Falls back to the first available instance, or None if Inventor is not running.
+
+    IMPORTANT: This only works when Python runs at the same integrity level as
+    Inventor (non-elevated).  See the AHK script for the required launch method.
     """
     apps = _get_all_inventor_apps()
     if not apps:
         # Legacy fallback: single-instance via GetActiveObject
         try:
             return win32com.client.GetActiveObject("Inventor.Application")
-        except Exception:
+        except Exception as e:
+            log.debug("GetActiveObject('Inventor.Application') failed: %s", e)
             return None
 
     # Try to find the instance whose main window is currently in the foreground.
@@ -427,6 +445,8 @@ def main() -> None:
     log.info("Inventor camera server  UDP %s:%d", UDP_HOST, UDP_PORT)
     log.info("Orbit sensitivity: %.4f  Pan sensitivity: %.4f",
              ORBIT_SENSITIVITY, PAN_SENSITIVITY)
+    log.info("Inventor CLSID: %s",
+             _INV_CLSID if _INV_CLSID else "NOT FOUND IN REGISTRY -- COM calls will fail")
 
     app                 = None
     last_reconnect      = 0.0

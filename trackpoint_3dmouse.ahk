@@ -113,10 +113,27 @@ NumPut("UShort", 2,                                                             
 NumPut("UShort", DllCall("ws2_32\htons",    "UShort", 9999,      "UShort"),               gSockAddr, 2)  ; sin_port
 NumPut("UInt",   DllCall("ws2_32\inet_addr","AStr",   "127.0.0.1","UInt"),                gSockAddr, 4)  ; sin_addr
 
-; Launch the Python camera server (pythonw = no console window)
+; Launch the Python camera server NON-ELEVATED via Shell.Application.
+; -----------------------------------------------------------------------
+; WHY: The AHK script runs elevated (admin) so raw-input interception works.
+;      Inventor runs at the user's default (medium / non-elevated) integrity.
+;      Windows keeps SEPARATE Running Object Tables for elevated vs. normal
+;      processes, so an elevated Python.exe cannot reach Inventor's COM object
+;      via GetActiveObject().  Shell.Application always spawns children at the
+;      user's default integrity level, bypassing the elevation of this script.
+; -----------------------------------------------------------------------
 _pyScript := A_ScriptDir "\inventor_camera_server.py"
 if FileExist(_pyScript) {
-    Run('pyw.exe "' _pyScript '"', A_ScriptDir, "Hide", &gPythonPID)
+    try {
+        shell := ComObject("Shell.Application")
+        shell.ShellExecute("pyw.exe", '"' _pyScript '"', A_ScriptDir, "", 0)
+    } catch as _e {
+        ; Fallback: elevated launch (COM to Inventor will likely fail, but
+        ; at least the server starts so UDP is ready if user fixes elevation)
+        Run('pyw.exe "' _pyScript '"', A_ScriptDir, "Hide", &gPythonPID)
+    }
+    ; ShellExecute doesn't return a PID -- discover it asynchronously via WMI.
+    SetTimer(FindPyServerPID, -2000)
 } else {
     MsgBox(
         "inventor_camera_server.py not found.`n" .
@@ -127,6 +144,22 @@ if FileExist(_pyScript) {
 }
 
 SetTimer(CheckEnvironment, 1000)
+
+; Discover the PID of the running Python camera server so OnScriptExit can
+; kill it cleanly.  Called once, 2 s after launch, via SetTimer.
+FindPyServerPID() {
+    global gPythonPID
+    try {
+        wmi := ComObjGet("winmgmts:")
+        for proc in wmi.ExecQuery(
+                "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name='pyw.exe'") {
+            if (proc.CommandLine && InStr(proc.CommandLine, "inventor_camera_server.py")) {
+                gPythonPID := proc.ProcessId
+                break
+            }
+        }
+    }
+}
 
 ; --- 4. ENVIRONMENT & STATE MANAGER ---
 CheckEnvironment() {

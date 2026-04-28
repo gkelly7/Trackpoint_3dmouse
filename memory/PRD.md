@@ -44,6 +44,12 @@ Orbit on bare TrackPoint movement; pan with center button held; zoom via scroll 
   - get_inventor(): matches foreground window PID to instance MainFrameHWND
   - Main loop polls every INSTANCE_POLL_INTERVAL (1s) and auto-switches to focused instance
   - last_reconnect reset to 0 on instance switch so reconnect is immediate (no 2s delay)
+- 2026-02: Fixed elevation mismatch (root cause of "no response in Inventor")
+  - AHK script was launching pyw.exe elevated (inherited from *RunAs admin)
+  - Elevated Python cannot see non-elevated Inventor in the Windows ROT
+  - Fix: launch pyw.exe via Shell.Application.ShellExecute (always non-elevated)
+  - PID discovery moved to async WMI query via SetTimer (2s after launch)
+  - Added diagnostic logging: CLSID at startup, ROT entries on scan miss, GetActiveObject exception message
 - 2026-02: AppSwitcher AHK helper provided (InventorMainWindows + CycleInventorInstances)
   - Filters Inventor sub-windows via: no owner + non-empty title + "Inventor" in title
 
