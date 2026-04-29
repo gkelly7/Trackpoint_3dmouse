@@ -73,13 +73,18 @@ except ImportError:
 # Configuration  — tune these to taste
 # ---------------------------------------------------------------------------
 
-# Fraction of eye→target distance panned per logical touchpad unit.
-# WPT logical units are typically 0–4095 or 0–32767 depending on the device.
-# Start conservative; we'll calibrate once we see real data.
-PAN_SENSITIVITY   = 0.0003
+# Fraction of eye→target distance panned when the two-finger centroid moves
+# the FULL width (pan_x) or height (pan_z) of the pad.
+# pan_x / pan_z are in normalised 0–1 space (divided by X_MAX / Y_MAX).
+# Examples: 0.8 → a full-width swipe pans 80 % of the eye→target distance.
+# Tune up if motion feels sluggish, down if it's too jumpy.
+PAN_SENSITIVITY   = 0.8
 
-# Zoom: fraction of eye→target distance per logical unit of pinch distance change.
-ZOOM_SENSITIVITY  = 0.0005
+# Fraction of eye→target distance the eye travels for a full-width pinch.
+# zoom is the change in normalised finger separation (0–~1.4).
+# A typical pinch (spread→touch) covers ~0.2–0.4 normalised units.
+# 1.5 → a half-width pinch moves the eye ~30 % of the way to the target.
+ZOOM_SENSITIVITY  = 1.5
 
 # Y-axis orbit: radians per radian of measured finger twist.
 TWIST_SENSITIVITY = 0.8
@@ -289,8 +294,8 @@ class WPTParser:
     #   3. Look for a log line like:
     #          fingers: [{'id':0, 'x_raw':NNNN, 'y_raw':MMMM, ...}]
     #   4. Set X_MAX = that x_raw value, Y_MAX = that y_raw value.
-    X_MAX = 3000   # approximate — calibrate with a corner touch (see above)
-    Y_MAX = 2000   # approximate — calibrate with a corner touch (see above)
+    X_MAX = 1150   # approximate — calibrate with a corner touch (see above)
+    Y_MAX = 770   # approximate — calibrate with a corner touch (see above)
 
     def parse(self, report_bytes: bytes):
         """
