@@ -250,17 +250,28 @@ class WPTParser:
           calibrate CONTACT_STRIDE, X_OFFSET, Y_OFFSET below.
     """
 
-    # Adjust these if raw report logging shows a different layout.
-    REPORT_ID    = 1     # Report ID byte (first byte of HID report)
-    CONTACT_STRIDE = 10  # bytes per finger contact in the report
-    TIP_OFFSET   = 0     # byte offset within a contact: tip-switch + contact-id
-    X_OFFSET     = 1     # byte offset within a contact: X low byte
-    Y_OFFSET     = 3     # byte offset within a contact: Y low byte
-    COUNT_OFFSET = -1    # byte offset from end of report: contact count (-1 = last byte)
+    # --- Calibrated for ThinkPad WPT (25-byte report, 4 contacts × 5 bytes) ---
+    # Report layout:
+    #   Byte  0    : Report ID = 3
+    #   Bytes 1-5  : Contact 0  (5 bytes: tip_id + X_lo + X_hi + Y_lo + Y_hi)
+    #   Bytes 6-10 : Contact 1
+    #   Bytes 11-15: Contact 2
+    #   Bytes 16-20: Contact 3
+    #   Bytes 21-22: Scan time (uint16 LE, ignored)
+    #   Byte  23   : Contact count (active fingers)
+    #   Byte  24   : Button state
+    REPORT_ID      = 3     # Report ID byte (first byte of HID report)
+    CONTACT_STRIDE = 5     # bytes per contact: tip_id(1) + X(2) + Y(2)
+    TIP_OFFSET     = 0     # byte within contact: bit0=Tip, bit1=InRange, bits2-7=ID
+    X_OFFSET       = 1     # byte within contact: X low byte (uint16 LE)
+    Y_OFFSET       = 3     # byte within contact: Y low byte (uint16 LE)
+    COUNT_OFFSET   = -2    # index from end: -1 = button, -2 = contact count
 
-    # Maximum logical coordinate value (used to normalise; set to actual value after calibration)
-    X_MAX = 32767
-    Y_MAX = 32767
+    # Logical coordinate maximums.
+    # To calibrate: run --debug-hid, press one finger into the far bottom-right
+    # corner of the trackpad and read the x_raw / y_raw values from the log.
+    X_MAX = 3000   # approximate — calibrate with a corner touch
+    Y_MAX = 2000   # approximate — calibrate with a corner touch
 
     def parse(self, report_bytes: bytes):
         """
