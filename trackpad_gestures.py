@@ -202,13 +202,28 @@ SIZEOF_RAWINPUT_HID = ctypes.sizeof(RAWINPUT_HID)
 _u32 = ctypes.windll.user32
 
 # WNDCLASSW must be defined manually — ctypes.wintypes does not include it.
+#
+# On 64-bit Windows, LRESULT / WPARAM / LPARAM are all 64-bit pointer-sized
+# integers.  ctypes.wintypes.WPARAM/LPARAM are defined as c_long (32-bit) in
+# Python's ctypes, which causes OverflowError when Windows passes pointer-sized
+# values as lparam.  Use the proper 64-bit types explicitly.
 WNDPROCTYPE = ctypes.WINFUNCTYPE(
-    ctypes.c_long,
+    ctypes.c_ssize_t,        # LRESULT  (LONG_PTR  — 64-bit on x64)
+    ctypes.wintypes.HWND,
+    ctypes.c_uint,           # UINT     message
+    ctypes.c_size_t,         # WPARAM   (UINT_PTR  — 64-bit on x64)
+    ctypes.c_ssize_t,        # LPARAM   (LONG_PTR  — 64-bit on x64)
+)
+
+# Declare DefWindowProcW with matching 64-bit types so passing large lparam
+# values through the default-call-handling path also works.
+_u32.DefWindowProcW.restype  = ctypes.c_ssize_t
+_u32.DefWindowProcW.argtypes = [
     ctypes.wintypes.HWND,
     ctypes.c_uint,
-    ctypes.wintypes.WPARAM,
-    ctypes.wintypes.LPARAM,
-)
+    ctypes.c_size_t,
+    ctypes.c_ssize_t,
+]
 
 class WNDCLASSW(ctypes.Structure):
     _fields_ = [
@@ -590,7 +605,9 @@ class TouchpadListener:
         if size.value == 0:
             return
 
-        buf = (ctypes.c_byte * size.value)()
+        # c_ubyte (unsigned) is required here; c_byte is signed (-128..127) and
+        # bytes() will raise ValueError on any byte value above 127.
+        buf = (ctypes.c_ubyte * size.value)()
         read = ctypes.windll.user32.GetRawInputData(
             lparam, 0x10000003,
             buf, ctypes.byref(size),
