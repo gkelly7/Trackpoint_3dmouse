@@ -18,6 +18,7 @@ import socket
 import struct
 import sys
 import time
+import winreg
 
 # Log file defined before basicConfig so the FileHandler can use it
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inventor_camera.log")
@@ -187,29 +188,32 @@ def _hwnd_to_inventor_pid(hwnd):
 # CLSID for "Inventor.Application" -- resolved once at startup so the
 # ROT scan can match by CLSID (class-moniker names look like
 # "clsid:{XXXXXXXX-...}", not like the ProgID string).
+#
+# pythoncom.CLSIDFromProgID uses the Win32 CLSIDFromProgID API which can miss
+# per-user COM registrations (HKCU\SOFTWARE\Classes).  pywintypes.IID is more
+# robust -- try it first, then fall back to the traditional API.
+_INV_CLSID = None
 try:
-    _INV_CLSID = str(pythoncom.CLSIDFromProgID("Inventor.Application")).lower()
+    import pywintypes as _pw
+    _INV_CLSID = str(_pw.IID("Inventor.Application")).lower()
 except Exception:
-    _INV_CLSID = None  # Inventor not installed on this machine
+    try:
+        _INV_CLSID = str(pythoncom.CLSIDFromProgID("Inventor.Application")).lower()
+    except Exception:
+        pass  # will warn at startup
 
 
 def _get_all_inventor_apps():
     """Enumerate every Inventor.Application instance from the Windows ROT.
 
-    Windows registers COM objects under their CLSID (e.g. "clsid:{...}"),
-    not under the human-readable ProgID.  We resolve the CLSID once at
-    import time and use it to filter ROT entries.
+    Matches by CLSID if the registry lookup succeeded; otherwise falls back to
+    searching for "inventor" anywhere in the moniker display name (handles
+    per-user COM registration where CLSIDFromProgID can fail).
 
-    NOTE: The Python process must run at the SAME integrity level as Inventor
-    (typically medium / non-elevated).  If Python runs elevated and Inventor
-    does not, the ROT is isolated and this function will return an empty list.
-    See the AHK script for the fix (Shell.Application non-elevated launch).
-
-    Returns a list (possibly empty) of COM Application objects.
+    NOTE: Python must run at the SAME integrity level as Inventor (both
+    non-elevated is ideal).  An elevated Python process cannot see
+    non-elevated COM objects via GetActiveObject or the ROT.
     """
-    if not _INV_CLSID:
-        log.warning("ROT scan skipped: Inventor.Application CLSID not found in registry")
-        return []
     apps = []
     try:
         ctx  = pythoncom.CreateBindCtx(0)
@@ -223,17 +227,21 @@ def _get_all_inventor_apps():
             try:
                 name = monikers[0].GetDisplayName(ctx, None).lower()
                 all_names.append(name)
-                if _INV_CLSID not in name:
+                # Primary match: by CLSID (exact).  Fallback: "inventor" substring.
+                if _INV_CLSID:
+                    is_match = (_INV_CLSID in name)
+                else:
+                    is_match = ("inventor" in name)
+                if not is_match:
                     continue
                 obj = rot.GetObject(monikers[0])
                 apps.append(win32com.client.Dispatch(obj))
-                log.debug("ROT: matched Inventor entry: %s", name)
+                log.info("ROT: found Inventor entry: %s", name)
             except Exception as e:
                 log.debug("ROT entry error: %s", e)
         if not apps:
-            log.debug("ROT: %d total entries, none matched CLSID %s",
-                      len(all_names), _INV_CLSID)
-            for n in all_names[:12]:
+            log.debug("ROT: %d total entries, none matched Inventor", len(all_names))
+            for n in all_names[:15]:
                 log.debug("  ROT: %s", n)
     except Exception as e:
         log.warning("ROT scan exception: %s", e)
@@ -445,8 +453,40 @@ def main() -> None:
     log.info("Inventor camera server  UDP %s:%d", UDP_HOST, UDP_PORT)
     log.info("Orbit sensitivity: %.4f  Pan sensitivity: %.4f",
              ORBIT_SENSITIVITY, PAN_SENSITIVITY)
-    log.info("Inventor CLSID: %s",
-             _INV_CLSID if _INV_CLSID else "NOT FOUND IN REGISTRY -- COM calls will fail")
+
+    # --- Startup diagnostics ---------------------------------------------------
+    # 1. Elevation check
+    try:
+        is_elevated = bool(ctypes.windll.shell32.IsUserAnAdmin())
+        if is_elevated:
+            log.warning("ELEVATED: Python is running as Administrator.")
+            log.warning("  Non-elevated Inventor cannot be seen in this ROT.")
+            log.warning("  Fix: ensure AHK launches pyw.exe via Shell.Application.")
+        else:
+            log.info("Integrity: non-elevated -- correct for non-elevated Inventor.")
+    except Exception as _e:
+        log.debug("Elevation check failed: %s", _e)
+
+    # 2. CLSID / registry check
+    log.info("Inventor CLSID (pywintypes.IID): %s", _INV_CLSID or "NOT RESOLVED")
+    try:
+        k = winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"Inventor.Application\CLSID")
+        log.info("Registry HKCR\\Inventor.Application\\CLSID = %s",
+                 winreg.QueryValue(k, ""))
+    except FileNotFoundError:
+        log.warning("Registry: HKCR\\Inventor.Application\\CLSID not found.")
+        # Also check per-user classes
+        try:
+            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                               r"SOFTWARE\Classes\Inventor.Application\CLSID")
+            log.info("Registry HKCU\\...\\Inventor.Application\\CLSID = %s",
+                     winreg.QueryValue(k, ""))
+        except FileNotFoundError:
+            log.warning("Registry: HKCU\\...\\Inventor.Application\\CLSID not found either.")
+            log.warning("  Inventor may not be installed, or uses a different ProgID.")
+    except Exception as _e:
+        log.warning("Registry check error: %s", _e)
+    # ---------------------------------------------------------------------------
 
     app                 = None
     last_reconnect      = 0.0
