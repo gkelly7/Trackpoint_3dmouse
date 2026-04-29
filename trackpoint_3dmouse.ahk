@@ -113,26 +113,140 @@ NumPut("UShort", 2,                                                             
 NumPut("UShort", DllCall("ws2_32\htons",    "UShort", 9999,      "UShort"),               gSockAddr, 2)  ; sin_port
 NumPut("UInt",   DllCall("ws2_32\inet_addr","AStr",   "127.0.0.1","UInt"),                gSockAddr, 4)  ; sin_addr
 
-; Launch the Python camera server NON-ELEVATED via Shell.Application.
 ; -----------------------------------------------------------------------
-; WHY: The AHK script runs elevated (admin) so raw-input interception works.
-;      Inventor runs at the user's default (medium / non-elevated) integrity.
-;      Windows keeps SEPARATE Running Object Tables for elevated vs. normal
-;      processes, so an elevated Python.exe cannot reach Inventor's COM object
-;      via GetActiveObject().  Shell.Application always spawns children at the
-;      user's default integrity level, bypassing the elevation of this script.
+; _LaunchNonElevated(exe, args, workDir)
+;   Launches exe at medium (non-elevated) integrity from an elevated script.
+;   Tries three methods in order; returns true if any succeeds.
+;
+;   WHY: AHK must run elevated for AutoHotInterception raw-input access.
+;        Inventor runs at medium integrity and registers in the medium ROT.
+;        Windows keeps SEPARATE Running Object Tables per integrity level,
+;        so Python must also be medium-integrity to reach Inventor via COM.
+;
+; Method 1 - ComObjActive("Shell.Application")
+;   Gets the RUNNING (non-elevated) explorer shell via GetActiveObject.
+;   ShellExecute on that object spawns the child at explorer's level.
+;
+; Method 2 - CreateProcessWithTokenW using explorer.exe's token
+;   Opens explorer.exe's process token, duplicates it as a primary token,
+;   then creates the process with that token directly.
+;
+; Method 3 - SAFER API (SaferCreateLevel / SaferComputeTokenFromLevel)
+;   Reduces the current elevated token to SAFER_LEVELID_NORMALUSER and
+;   uses CreateProcessAsUserW.  Official Microsoft API for this use case.
 ; -----------------------------------------------------------------------
+_LaunchNonElevated(exe, args, workDir) {
+
+    ; ---- Method 1: active Shell.Application (non-elevated explorer) ----
+    try {
+        shell := ComObjActive("Shell.Application")
+        shell.ShellExecute(exe, args, workDir, "", 0)
+        return true
+    }
+
+    ; ---- Method 2: steal explorer.exe token + CreateProcessWithTokenW ----
+    hwndShell := DllCall("GetShellWindow", "Ptr")
+    if hwndShell {
+        DllCall("GetWindowThreadProcessId", "Ptr", hwndShell,
+                "UInt*", &_shellPID := 0, "UInt")
+        if _shellPID {
+            ; PROCESS_QUERY_INFORMATION = 0x0400
+            _hProc := DllCall("OpenProcess", "UInt", 0x0400, "Int", 0,
+                              "UInt", _shellPID, "Ptr")
+            if _hProc {
+                ; TOKEN_DUPLICATE = 0x0002
+                DllCall("OpenProcessToken", "Ptr", _hProc, "UInt", 0x0002,
+                        "Ptr*", &_hTok := 0)
+                DllCall("CloseHandle", "Ptr", _hProc)
+                if _hTok {
+                    _hPri := 0
+                    ; DuplicateTokenEx: MAXIMUM_ALLOWED, SecurityImpersonation=2, TokenPrimary=1
+                    DllCall("advapi32\DuplicateTokenEx",
+                            "Ptr", _hTok, "UInt", 0x02000000,
+                            "Ptr", 0, "Int", 2, "Int", 1,
+                            "Ptr*", &_hPri := 0)
+                    DllCall("CloseHandle", "Ptr", _hTok)
+                    if _hPri {
+                        ; STARTUPINFOW (64-bit: 104 bytes; dwFlags@60, wShowWindow@64)
+                        _si := Buffer(104, 0)
+                        NumPut("UInt",   104, _si,  0)  ; cb
+                        NumPut("UInt",   0x1, _si, 60)  ; dwFlags = STARTF_USESHOWWINDOW
+                        NumPut("UShort", 0,   _si, 64)  ; wShowWindow = SW_HIDE
+                        _pi := Buffer(24, 0)             ; PROCESS_INFORMATION (64-bit)
+                        _cmd := '"' exe '" ' args
+                        _ok := DllCall("advapi32\CreateProcessWithTokenW",
+                                       "Ptr",  _hPri,
+                                       "UInt", 0,
+                                       "Ptr",  0,
+                                       "Str",  _cmd,
+                                       "UInt", 0x08000000,
+                                       "Ptr",  0,
+                                       "Str",  workDir,
+                                       "Ptr",  _si,
+                                       "Ptr",  _pi,
+                                       "Int")
+                        DllCall("CloseHandle", "Ptr", _hPri)
+                        if _ok {
+                            DllCall("CloseHandle", "Ptr", NumGet(_pi, 0, "Ptr"))
+                            DllCall("CloseHandle", "Ptr", NumGet(_pi, 8, "Ptr"))
+                            return true
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ; ---- Method 3: SAFER API ------------------------------------------------
+    _hLevel := 0
+    ; SaferCreateLevel(SAFER_SCOPEID_USER=1, SAFER_LEVELID_NORMALUSER=0x20000, open=0)
+    if DllCall("advapi32\SaferCreateLevel",
+               "UInt", 1, "UInt", 0x20000, "UInt", 0,
+               "Ptr*", &_hLevel := 0, "Ptr", 0, "Int") {
+        _hSaferTok := 0
+        DllCall("advapi32\SaferComputeTokenFromLevel",
+                "Ptr", _hLevel, "Ptr", 0, "Ptr*", &_hSaferTok := 0,
+                "UInt", 0, "Ptr", 0, "Int")
+        DllCall("advapi32\SaferCloseLevel", "Ptr", _hLevel, "Int")
+        if _hSaferTok {
+            _si2 := Buffer(104, 0)
+            NumPut("UInt",   104, _si2,  0)
+            NumPut("UInt",   0x1, _si2, 60)
+            NumPut("UShort", 0,   _si2, 64)
+            _pi2 := Buffer(24, 0)
+            _cmd2 := '"' exe '" ' args
+            _ok2 := DllCall("advapi32\CreateProcessAsUserW",
+                            "Ptr",  _hSaferTok,
+                            "Ptr",  0,
+                            "Str",  _cmd2,
+                            "Ptr",  0, "Ptr", 0,
+                            "Int",  0,
+                            "UInt", 0x08000000,
+                            "Ptr",  0,
+                            "Str",  workDir,
+                            "Ptr",  _si2,
+                            "Ptr",  _pi2,
+                            "Int")
+            DllCall("CloseHandle", "Ptr", _hSaferTok)
+            if _ok2 {
+                DllCall("CloseHandle", "Ptr", NumGet(_pi2, 0, "Ptr"))
+                DllCall("CloseHandle", "Ptr", NumGet(_pi2, 8, "Ptr"))
+                return true
+            }
+        }
+    }
+
+    return false  ; all methods failed; caller falls back to elevated Run
+}
+
 _pyScript := A_ScriptDir "\inventor_camera_server.py"
 if FileExist(_pyScript) {
-    try {
-        shell := ComObject("Shell.Application")
-        shell.ShellExecute("pyw.exe", '"' _pyScript '"', A_ScriptDir, "", 0)
-    } catch as _e {
-        ; Fallback: elevated launch (COM to Inventor will likely fail, but
-        ; at least the server starts so UDP is ready if user fixes elevation)
+    if !_LaunchNonElevated("pyw.exe", '"' _pyScript '"', A_ScriptDir) {
+        ; All non-elevated methods failed -- elevated fallback.
+        ; Python will log "ELEVATED" and COM to Inventor won't work.
         Run('pyw.exe "' _pyScript '"', A_ScriptDir, "Hide", &gPythonPID)
     }
-    ; ShellExecute doesn't return a PID -- discover it asynchronously via WMI.
+    ; Non-elevated launches don't return a PID -- find it via WMI after 2 s.
     SetTimer(FindPyServerPID, -2000)
 } else {
     MsgBox(
@@ -145,8 +259,7 @@ if FileExist(_pyScript) {
 
 SetTimer(CheckEnvironment, 1000)
 
-; Discover the PID of the running Python camera server so OnScriptExit can
-; kill it cleanly.  Called once, 2 s after launch, via SetTimer.
+; Discover the PID of the Python camera server 2 s after launch (WMI query).
 FindPyServerPID() {
     global gPythonPID
     try {
@@ -160,302 +273,4 @@ FindPyServerPID() {
         }
     }
 }
-
 ; --- 4. ENVIRONMENT & STATE MANAGER ---
-CheckEnvironment() {
-    global manualOverride, wasMouseConnected, isKidMode
-
-    if (isKidMode)  ; never auto-switch modes while kids mode is active
-        return
-
-    mouseConnected := CheckForExternalMouse()
-
-    if (mouseConnected && !wasMouseConnected) {
-        manualOverride := false
-        ApplyMode()
-    } else if (!mouseConnected && wasMouseConnected) {
-        manualOverride := true
-        ApplyMode()
-    }
-
-    wasMouseConnected := mouseConnected
-}
-
-ApplyMode() {
-    global manualOverride, isSubscribed, extSubscribed, tpId, extId, extVid, extPid, AHI
-    global isDragging, activeDragButton, isShiftDown, isKidMode
-
-    if (isKidMode)  ; never modify mode state while kids mode is active
-        return
-
-    if (manualOverride) {
-        ; COUCH MODE
-        ToggleTrackpad(true)
-
-        if (isSubscribed) {
-            AHI.UnsubscribeMouseMoveRelative(tpId)
-            AHI.UnsubscribeMouseButton(tpId, 0)
-            AHI.UnsubscribeMouseButton(tpId, 1)
-            AHI.UnsubscribeMouseButton(tpId, 2)
-            isSubscribed := false
-
-            if (isDragging && activeDragButton != "") {
-                Send("{" activeDragButton " Up}")
-                isDragging := false
-            }
-            if (isShiftDown) {
-                Send("{Shift Up}")
-                isShiftDown := false
-            }
-        }
-
-        if (extVid && extPid && CheckForExternalMouse()) {
-            extId := AHI.GetMouseId(extVid, extPid)
-            if (extId && !extSubscribed) {
-                AHI.SubscribeMouseMoveRelative(extId, false, OnExtMouseWakeMove)
-                AHI.SubscribeMouseButton(extId, 0, false, OnExtMouseWakeBtn)
-                extSubscribed := true
-            }
-        } else {
-            extId        := 0
-            extSubscribed := false
-        }
-
-        ToolTip("Couch Mode: Trackpad ON")
-        SetTimer(() => ToolTip(), -1500)
-        TraySetIcon("couch.ico", 1, false)
-
-    } else {
-        ; DESK MODE
-        ToggleTrackpad(false)
-
-        if (!isSubscribed) {
-            AHI.SubscribeMouseMoveRelative(tpId, true, OnTrackpointMove)
-            AHI.SubscribeMouseButton(tpId, 0, true, OnLeftBtn)
-            AHI.SubscribeMouseButton(tpId, 1, true, OnRightBtn)
-            AHI.SubscribeMouseButton(tpId, 2, true, OnCenterBtn)
-            isSubscribed := true
-        }
-
-        if (extId && extSubscribed) {
-            AHI.UnsubscribeMouseMoveRelative(extId)
-            AHI.UnsubscribeMouseButton(extId, 0)
-            extSubscribed := false
-        }
-
-        ToolTip("Desk Mode: Trackpad OFF")
-        SetTimer(() => ToolTip(), -1500)
-        TraySetIcon("3d.ico", 1, false)
-    }
-}
-
-; --- 5. HARDWARE SCANNER ---
-CheckForExternalMouse() {
-    global extVid, extPid
-    try {
-        wmi   := ComObjGet("winmgmts:")
-        query := wmi.ExecQuery("SELECT * FROM Win32_PointingDevice")
-
-        for device in query {
-            id := device.PNPDeviceID
-
-            if !InStr(id, "ACPI") && !InStr(id, "DRIVERENUM") {
-                if RegExMatch(id, "i)VID[_\&]([0-9A-F]{4}).*PID[_\&]([0-9A-F]{4})", &matches) {
-                    extVid := Integer("0x" . matches[1])
-                    extPid := Integer("0x" . matches[2])
-                    return true
-                }
-            }
-        }
-    }
-    return false
-}
-
-
-; --- 6. TRACKPAD MASTER SWITCH ---
-ToggleTrackpad(state) {
-    regPath := "HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\PrecisionTouchPad\Status"
-    try {
-        RegWrite(state ? 1 : 0, "REG_DWORD", regPath, "Enabled")
-        SendMessage(0x1A, 0, StrPtr("PrecisionTouchPad"), , "ahk_id 0xFFFF")
-    }
-}
-
-; --- 7. EXTERNAL MOUSE WAKE LOGIC ---
-OnExtMouseWakeMove(x, y) {
-    global manualOverride
-    if (manualOverride && (Abs(x) > 5 || Abs(y) > 5)) {
-        manualOverride := false
-        ApplyMode()
-    }
-}
-
-OnExtMouseWakeBtn(state) {
-    global manualOverride
-    if (manualOverride && state) {
-        manualOverride := false
-        ApplyMode()
-    }
-}
-
-; --- 8. BUTTON REMAPS & OVERRIDE ---
-OnLeftBtn(state) {
-    global isShiftDown, manualOverride, escSuppressed, isKidMode
-    if (isKidMode)
-        return
-    if (state) {
-        if (isShiftDown) {
-            escSuppressed := true
-            manualOverride := !manualOverride
-            ApplyMode()
-            return
-        }
-        Send("{Esc Down}")
-    } else {
-        if (escSuppressed) {
-            escSuppressed := false
-            return
-        }
-        Send("{Esc Up}")
-    }
-}
-
-OnRightBtn(state) {
-    global isKidMode
-    if (isKidMode)
-        return
-    if (state) {
-        Send("{Enter Down}")
-    } else {
-        Send("{Enter Up}")
-    }
-}
-
-; Center button: suppress Shift/Home when Inventor is active so they don't
-; interfere with the 3D orbit.  isShiftDown still acts as the pan-mode flag.
-OnCenterBtn(state) {
-    global isShiftDown, centerBtnDownTime, isKidMode
-    if (isKidMode)
-        return
-    if (state) {
-        centerBtnDownTime := A_TickCount
-        isShiftDown := true
-        if !WinActive("ahk_exe Inventor.exe")
-            Send("{Shift Down}")
-    } else {
-        isShiftDown := false
-        if WinActive("ahk_exe Inventor.exe") {
-            ; No Shift Up / Home sent to Inventor
-        } else {
-            Send("{Shift Up}")
-            if (A_TickCount - centerBtnDownTime < 250)
-                Send("{Home}")
-        }
-    }
-}
-
-; --- 9. MOVEMENT LOGIC ---
-
-Send3DMove(x, y, mode) {
-    global gUdpSocket, gSockAddr
-    data := Buffer(9)
-    NumPut("Int",   x,    data, 0)  ; bytes 0-3: x delta (signed int32 LE)
-    NumPut("Int",   y,    data, 4)  ; bytes 4-7: y delta (signed int32 LE)
-    NumPut("UChar", mode, data, 8)  ; byte    8: 0=orbit  1=pan
-    DllCall("ws2_32\sendto",
-        "Ptr",  gUdpSocket,
-        "Ptr",  data,
-        "Int",  9,
-        "Int",  0,
-        "Ptr",  gSockAddr,
-        "Int",  16)
-}
-
-OnTrackpointMove(x, y) {
-    global isShiftDown, isKidMode
-    if (isKidMode)
-        return
-
-    if WinActive("ahk_exe Inventor.exe") {
-        ; Dead zone: skip tiny drift so TrackPoint drift does not flood Inventor
-        if (Abs(x) <= tpDeadzone && Abs(y) <= tpDeadzone)
-            return
-
-        ; Drawing files (.idw/.dwg) are 2-D: pan by default, orbit when centre held.
-        ; Part/assembly files: orbit by default, pan when centre held.
-        title := WinGetTitle("A")
-        isDrawing := InStr(title, ".idw") || InStr(title, ".dwg")
-        if (isDrawing)
-            Send3DMove(x, y, isShiftDown ? 0 : 1)  ; drawing: pan=default  orbit=centre
-        else
-            Send3DMove(x, y, isShiftDown ? 1 : 0)  ; model:   orbit=default pan=centre
-        return
-    }
-
-    ; Outside Inventor: pass movement through as normal cursor movement.
-    ; (Subscription is block=true so we must re-inject the delta manually.)
-    DllCall("mouse_event", "UInt", 0x0001, "Int", x, "Int", y, "UInt", 0, "UPtr", 0)
-}
-
-
-; --- 10. TOUCHSCREEN MANAGER ---
-global isTouchScreenOn := false
-ToggleTouchscreen(false) ; Force off on script startup
-
-^!t:: {
-    global isTouchScreenOn
-    isTouchScreenOn := !isTouchScreenOn
-    ToggleTouchscreen(isTouchScreenOn)
-    ToolTip("Touchscreen: " . (isTouchScreenOn ? "ON" : "OFF"))
-    SetTimer(() => ToolTip(), -2000)
-}
-
-ToggleTouchscreen(state) {
-    action     := state ? "Enable" : "Disable"
-    targetName := "*touchskærm*"
-    psCmd      := "Get-PnpDevice -FriendlyName '" targetName "' | " action "-PnpDevice -Confirm:$false"
-    RunWait('powershell.exe -NoProfile -WindowStyle Hidden -Command "' psCmd '"', , "Hide")
-}
-
-; --- 11. KID MODE ---
-global isKidMode := false
-global kidHook   := InputHook("V0")
-kidHook.KeyOpt("{All}", "S")
-kidHook.KeyOpt("{Esc}", "E")
-kidHook.OnEnd := ExitKidMode
-
-^!k:: {
-    global isKidMode, kidHook, isSubscribed, AHI, tpId
-    if (isKidMode)
-        return
-
-    isKidMode := true
-    ToolTip("KID MODE ACTIVE`nPress ESC to exit")
-    SetTimer(() => ToolTip(), -3000)
-
-    ; If in couch mode the trackpoint is unsubscribed (passes through as a normal
-    ; mouse).  Re-subscribe with blocking so it cannot move the cursor in kids mode.
-    if (!isSubscribed) {
-        AHI.SubscribeMouseMoveRelative(tpId, true, OnTrackpointMove)
-        AHI.SubscribeMouseButton(tpId, 0, true, OnLeftBtn)
-        AHI.SubscribeMouseButton(tpId, 1, true, OnRightBtn)
-        AHI.SubscribeMouseButton(tpId, 2, true, OnCenterBtn)
-        isSubscribed := true
-    }
-
-    ToggleTrackpad(false)     ; always off in kids mode
-    ToggleTouchscreen(false)  ; always off; isTouchScreenOn unchanged so exit restores it
-    kidHook.Start()
-    TraySetIcon("kid.ico", 1, false)
-}
-
-ExitKidMode(hook, *) {
-    global isKidMode, isTouchScreenOn
-    isKidMode := false
-
-    ApplyMode()
-    ToggleTouchscreen(isTouchScreenOn)
-
-    ToolTip("Kid Mode Deactivated")
-    SetTimer(() => ToolTip(), -2000)
-}
