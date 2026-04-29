@@ -640,6 +640,39 @@ class TouchpadListener:
 
 
 # ---------------------------------------------------------------------------
+# Elevation helpers
+# ---------------------------------------------------------------------------
+def _is_elevated() -> bool:
+    """True if this process has admin / high-integrity privileges."""
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _relaunch_nonadmin(extra_args: list) -> None:
+    """
+    Relaunch THIS script at medium (non-admin) integrity by going through
+    Shell.Application.ShellExecute, which always inherits Explorer's token
+    rather than the caller's elevated token.
+    The current (elevated) process exits immediately after spawning.
+    """
+    import shlex
+    script   = os.path.abspath(__file__)
+    all_args = [f'"{script}"'] + [shlex.quote(a) for a in extra_args]
+    cmd_args = " ".join(all_args)
+    log.info("Re-launching non-elevated: %s %s", sys.executable, cmd_args)
+    try:
+        shell = win32com.client.Dispatch("Shell.Application")
+        shell.ShellExecute(sys.executable, cmd_args,
+                           os.path.dirname(script), "", 1)
+    except Exception as e:
+        log.error("ShellExecute relaunch failed: %s", e)
+        log.error("Please close this window and re-run from a normal "
+                  "(non-Administrator) command prompt.")
+
+
+# ---------------------------------------------------------------------------
 # Inventor connection
 # ---------------------------------------------------------------------------
 def get_inventor():
@@ -658,9 +691,35 @@ def main():
     parser = argparse.ArgumentParser(description="Trackpad gesture Inventor controller")
     parser.add_argument("--debug-hid", action="store_true",
                         help="Print every raw HID report to the log (for layout calibration)")
+    parser.add_argument("--no-relaunch", action="store_true",
+                        help="Skip automatic non-elevated relaunch (use if relaunch loops)")
     args = parser.parse_args()
 
     pythoncom.CoInitialize()
+
+    # -----------------------------------------------------------------------
+    # Elevation guard
+    # Inventor runs at medium integrity (non-elevated).  A Python process
+    # running as Administrator cannot see Inventor in the Windows ROT, so
+    # GetActiveObject will always fail with MK_E_UNAVAILABLE (0x800401E3).
+    # Automatically re-launch through Shell.Application to shed elevation.
+    # -----------------------------------------------------------------------
+    if _is_elevated():
+        if args.no_relaunch:
+            log.warning(
+                "Running as Administrator but --no-relaunch is set. "
+                "GetActiveObject will likely fail. "
+                "Run from a normal (non-admin) command prompt instead."
+            )
+        else:
+            log.warning("Detected elevated (Administrator) process. "
+                        "Relaunching non-elevated so Inventor is visible...")
+            forward = sys.argv[1:]          # pass through all original flags
+            if "--no-relaunch" not in forward:
+                forward.append("--no-relaunch")   # prevent re-launch loop
+            _relaunch_nonadmin(forward)
+            pythoncom.CoUninitialize()
+            sys.exit(0)
 
     log.info("Trackpad gesture controller starting.")
     log.info("Pan sensitivity: %.6f  Zoom: %.6f  Twist: %.4f",
