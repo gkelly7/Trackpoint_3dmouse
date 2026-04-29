@@ -56,10 +56,29 @@ Orbit on bare TrackPoint movement; pan with center button held; zoom via scroll 
 ## User Personas
 - Power CAD user with ThinkPad, no dedicated 3D mouse, familiar with AHK+Python
 
+## Trackpad Gesture Script (trackpad_gestures.py)
+Standalone script reading raw WPT HID reports via RegisterRawInputDevices.
+Maps 2-finger gestures to Inventor camera: pan / pinch-zoom / twist-rotate.
+- 2026-02: Created hidden Win32 message window + RegisterRawInputDevices for WPT
+- 2026-02: Calibrated WPTParser for ThinkPad: REPORT_ID=3, CONTACT_STRIDE=5,
+  5-byte format: tip_id(1) + X_u16_LE(2) + Y_u16_LE(2), COUNT_OFFSET=-2
+- 2026-02: Added debug logging in parse() showing finger (id, x_raw, y_raw) tuples
+- 2026-02: Added 2-finger debug log in on_fingers() callback
+- 2026-02: Added X_MAX/Y_MAX calibration instructions in code comments
+
+### Next steps for trackpad
+1. User runs: python trackpad_gestures.py --debug-hid
+2. Verify "fingers (N active): [(id, x_raw, y_raw), ...]" lines appear
+3. Calibrate X_MAX / Y_MAX using far-corner touch (read x_raw / y_raw from log)
+4. Test 2-finger gestures in Inventor; tune PAN_SENSITIVITY / ZOOM_SENSITIVITY
+5. (Stretch) Twist-to-rotate: test if angle noise is acceptable on hardware
+
 ## Backlog / Enhancements
 - P1: Test with actual Inventor 2024 and tune default sensitivities
 - P1: Add separate ORBIT_SENSITIVITY_H / ORBIT_SENSITIVITY_V config
+- P1: Calibrate trackpad X_MAX / Y_MAX on hardware; verify pan/zoom feel
 - P2: Support Presentation documents (kPresentationDocumentObject=12293)
 - P2: Optional momentum/inertia after TrackPoint release
 - P2: Tray notification showing connected/disconnected status
+- P3: Twist-to-rotate (Y-axis orbit) via 2-finger angle — depends on noise level
 - P3: 3DConnexion virtual HID emulation (full 6DOF, needs kernel driver)

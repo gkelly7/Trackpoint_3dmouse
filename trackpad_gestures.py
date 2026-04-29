@@ -268,10 +268,14 @@ class WPTParser:
     COUNT_OFFSET   = -2    # index from end: -1 = button, -2 = contact count
 
     # Logical coordinate maximums.
-    # To calibrate: run --debug-hid, press one finger into the far bottom-right
-    # corner of the trackpad and read the x_raw / y_raw values from the log.
-    X_MAX = 3000   # approximate — calibrate with a corner touch
-    Y_MAX = 2000   # approximate — calibrate with a corner touch
+    # HOW TO CALIBRATE:
+    #   1. Run:  python trackpad_gestures.py --debug-hid
+    #   2. Press one finger firmly into the FAR BOTTOM-RIGHT corner of the pad.
+    #   3. Look for a log line like:
+    #          fingers: [{'id':0, 'x_raw':NNNN, 'y_raw':MMMM, ...}]
+    #   4. Set X_MAX = that x_raw value, Y_MAX = that y_raw value.
+    X_MAX = 3000   # approximate — calibrate with a corner touch (see above)
+    Y_MAX = 2000   # approximate — calibrate with a corner touch (see above)
 
     def parse(self, report_bytes: bytes):
         """
@@ -290,8 +294,8 @@ class WPTParser:
         if len(data) < self.CONTACT_STRIDE:
             return None
 
-        # Contact count is the last byte (or COUNT_OFFSET from end)
-        count = data[self.COUNT_OFFSET] if self.COUNT_OFFSET == -1 else data[self.COUNT_OFFSET]
+        # Contact count lives at COUNT_OFFSET from the end of the stripped data.
+        count = data[self.COUNT_OFFSET]
         count = max(0, min(count, len(data) // self.CONTACT_STRIDE))
 
         fingers = []
@@ -314,6 +318,10 @@ class WPTParser:
                     "x_raw": x_raw,
                     "y_raw": y_raw,
                 })
+
+        if fingers:
+            log.debug("fingers (%d active): %s", len(fingers),
+                      [(f["id"], f["x_raw"], f["y_raw"]) for f in fingers])
 
         return fingers
 
@@ -648,6 +656,11 @@ def main():
         nonlocal app
         if app is None:
             return
+
+        if len(fingers) == 2:
+            log.debug("2-finger gesture: p1=(%d,%d) p2=(%d,%d)",
+                      fingers[0]["x_raw"], fingers[0]["y_raw"],
+                      fingers[1]["x_raw"], fingers[1]["y_raw"])
 
         result = gesture.process(fingers)
         if result is None:
