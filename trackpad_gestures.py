@@ -201,6 +201,29 @@ SIZEOF_RAWINPUT_HID = ctypes.sizeof(RAWINPUT_HID)
 
 _u32 = ctypes.windll.user32
 
+# WNDCLASSW must be defined manually — ctypes.wintypes does not include it.
+WNDPROCTYPE = ctypes.WINFUNCTYPE(
+    ctypes.c_long,
+    ctypes.wintypes.HWND,
+    ctypes.c_uint,
+    ctypes.wintypes.WPARAM,
+    ctypes.wintypes.LPARAM,
+)
+
+class WNDCLASSW(ctypes.Structure):
+    _fields_ = [
+        ("style",         ctypes.c_uint),
+        ("lpfnWndProc",   WNDPROCTYPE),
+        ("cbClsExtra",    ctypes.c_int),
+        ("cbWndExtra",    ctypes.c_int),
+        ("hInstance",     ctypes.wintypes.HANDLE),
+        ("hIcon",         ctypes.wintypes.HANDLE),
+        ("hCursor",       ctypes.wintypes.HANDLE),
+        ("hbrBackground", ctypes.wintypes.HANDLE),
+        ("lpszMenuName",  ctypes.wintypes.LPCWSTR),
+        ("lpszClassName", ctypes.wintypes.LPCWSTR),
+    ]
+
 
 # ---------------------------------------------------------------------------
 # WPT HID report parser
@@ -480,26 +503,20 @@ class TouchpadListener:
 
     def _run(self):
         """Message loop — runs entirely on this thread."""
-        # Register a window class
-        WNDPROCTYPE = ctypes.WINFUNCTYPE(
-            ctypes.c_long,
-            ctypes.wintypes.HWND,
-            ctypes.c_uint,
-            ctypes.wintypes.WPARAM,
-            ctypes.wintypes.LPARAM,
-        )
-        wndproc = WNDPROCTYPE(self._wndproc)  # keep a reference!
+        WCLASS_NAME = "TrackpadGestureWindow"
 
-        wc = ctypes.wintypes.WNDCLASS()
-        wc.lpfnWndProc   = wndproc
+        wndproc_cb = WNDPROCTYPE(self._wndproc)   # must stay alive
+        self._wndproc_cb = wndproc_cb              # keep reference so GC can't collect it
+
+        wc = WNDCLASSW()
+        wc.lpfnWndProc   = wndproc_cb
         wc.hInstance     = ctypes.windll.kernel32.GetModuleHandleW(None)
-        wc.lpszClassName = "TrackpadGestureWindow"
-        if not _u32.RegisterClassW(ctypes.byref(wc)):
-            pass  # class may already be registered on retry
+        wc.lpszClassName = WCLASS_NAME
+        _u32.RegisterClassW(ctypes.byref(wc))     # ignore failure (re-register is OK)
 
         HWND_MESSAGE = ctypes.wintypes.HWND(-3)
         self._hwnd = _u32.CreateWindowExW(
-            0, "TrackpadGestureWindow", "TrackpadGesture",
+            0, WCLASS_NAME, "TrackpadGesture",
             0, 0, 0, 0, 0,
             HWND_MESSAGE, None,
             ctypes.windll.kernel32.GetModuleHandleW(None), None,
