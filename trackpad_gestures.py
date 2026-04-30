@@ -27,12 +27,12 @@ Usage:
 Log file:  trackpad_gestures.log  (next to this script)
 """
 
+import collections
 import ctypes
 import ctypes.wintypes
 import logging
 import math
 import os
-import queue as _queue
 import struct
 import sys
 import threading
