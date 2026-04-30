@@ -175,6 +175,23 @@ RIDEV_DEVNOTIFY   = 0x00002000
 HID_USAGE_PAGE_DIGITIZER = 0x0D
 HID_USAGE_TOUCHPAD       = 0x05
 
+# Low-level mouse hook — used to suppress WM_MOUSEWHEEL / WM_MOUSEHWHEEL
+# while a two-finger gesture is active, preventing Inventor from also acting
+# on the same touchpad events natively.
+WH_MOUSE_LL    = 14
+WM_MOUSEWHEEL  = 0x020A
+WM_MOUSEHWHEEL = 0x020E
+_LL_HOOKPROC   = ctypes.WINFUNCTYPE(
+    ctypes.c_ssize_t,   # LRESULT
+    ctypes.c_int,       # nCode
+    ctypes.c_size_t,    # wParam
+    ctypes.c_ssize_t,   # lParam
+)
+
+# Event set while ≥2 fingers are on the pad; cleared when pad is idle.
+# The mouse hook reads this to decide whether to block scroll events.
+_two_fingers_active = threading.Event()
+
 # RAWINPUTDEVICE
 class RAWINPUTDEVICE(ctypes.Structure):
     _fields_ = [
@@ -599,11 +616,36 @@ class TouchpadListener:
 
         self._ready.set()
 
+        # Install a low-level mouse hook to swallow WM_MOUSEWHEEL /
+        # WM_MOUSEHWHEEL while two fingers are on the pad.  This prevents
+        # Inventor from receiving the native scroll-to-zoom / pinch-to-zoom
+        # events that the WPT driver synthesises from the same HID data.
+        # The hook fires on THIS thread (inside GetMessageW) so the Event flag
+        # set by on_fingers (also this thread) is always up-to-date.
+        def _ll_mouse_hook(nCode, wParam, lParam):
+            if nCode >= 0 and _two_fingers_active.is_set():
+                if wParam in (WM_MOUSEWHEEL, WM_MOUSEHWHEEL):
+                    return 1   # consume — do NOT forward to apps
+            return _u32.CallNextHookEx(None, nCode, wParam, lParam)
+
+        self._ll_hook_cb = _LL_HOOKPROC(_ll_mouse_hook)  # keep ref alive
+        self._ll_hook = _u32.SetWindowsHookExW(
+            WH_MOUSE_LL, self._ll_hook_cb, None, 0)
+        if self._ll_hook:
+            log.info("Mouse-scroll suppression hook installed.")
+        else:
+            log.warning("SetWindowsHookExW(WH_MOUSE_LL) failed (err %d) — "
+                        "native scroll may interfere.", ctypes.GetLastError())
+
         # Standard Win32 message pump
         msg = ctypes.wintypes.MSG()
         while _u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             _u32.TranslateMessage(ctypes.byref(msg))
             _u32.DispatchMessageW(ctypes.byref(msg))
+
+        if self._ll_hook:
+            _u32.UnhookWindowsHookEx(self._ll_hook)
+            self._ll_hook = None
 
     def _wndproc(self, hwnd, msg, wparam, lparam):
         if msg == WM_INPUT:
@@ -753,6 +795,12 @@ def main():
 
     def on_fingers(fingers):
         """Called from the TouchpadListener thread — only buffer, never touch COM."""
+        # Keep the scroll-block flag in sync with finger count.
+        # The LL mouse hook (same thread) reads this before forwarding scroll events.
+        if len(fingers) >= 2:
+            _two_fingers_active.set()
+        else:
+            _two_fingers_active.clear()
         with _finger_lock:
             _finger_buf.append(fingers)
 
