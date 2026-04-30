@@ -32,6 +32,7 @@ import ctypes.wintypes
 import logging
 import math
 import os
+import queue as _queue
 import struct
 import sys
 import threading
@@ -732,27 +733,11 @@ def main():
     app     = None
     last_reconnect = 0.0
     RECONNECT_INTERVAL = 2.0
+    finger_queue = _queue.Queue()
 
     def on_fingers(fingers):
-        nonlocal app
-        if app is None:
-            return
-
-        if len(fingers) == 2:
-            log.debug("2-finger gesture: p1=(%d,%d) p2=(%d,%d)",
-                      fingers[0]["x_raw"], fingers[0]["y_raw"],
-                      fingers[1]["x_raw"], fingers[1]["y_raw"])
-
-        result = gesture.process(fingers)
-        if result is None:
-            return
-
-        pan_x, pan_z, zoom, twist_y = result
-        try:
-            apply_gesture(app, pan_x, pan_z, zoom, twist_y)
-        except Exception as e:
-            log.warning("apply_gesture failed: %s", e)
-            # Don't disconnect here; let the main loop handle reconnect
+        """Called from the TouchpadListener thread — only queue, never touch COM."""
+        finger_queue.put(fingers)
 
     listener = TouchpadListener(on_fingers, debug_hid=args.debug_hid)
     listener.start()
@@ -764,7 +749,7 @@ def main():
         while True:
             now = time.monotonic()
 
-            # Reconnect / connect to Inventor
+            # Reconnect / connect to Inventor (main thread = COM thread)
             if app is None and (now - last_reconnect) >= RECONNECT_INTERVAL:
                 last_reconnect = now
                 _cs["valid"] = False
@@ -773,6 +758,28 @@ def main():
                     log.info("Connected to Inventor.")
                 else:
                     log.info("Waiting for Inventor...")
+
+            # Drain the gesture queue — apply_gesture runs here on the COM thread
+            while app is not None:
+                try:
+                    fingers = finger_queue.get_nowait()
+                except _queue.Empty:
+                    break
+
+                if len(fingers) == 2:
+                    log.debug("2-finger gesture: p1=(%d,%d) p2=(%d,%d)",
+                              fingers[0]["x_raw"], fingers[0]["y_raw"],
+                              fingers[1]["x_raw"], fingers[1]["y_raw"])
+
+                result = gesture.process(fingers)
+                if result is None:
+                    continue
+
+                pan_x, pan_z, zoom, twist_y = result
+                try:
+                    apply_gesture(app, pan_x, pan_z, zoom, twist_y)
+                except Exception as e:
+                    log.warning("apply_gesture failed: %s", e)
 
             # Heartbeat
             if now - _heartbeat >= 10.0:
@@ -790,7 +797,7 @@ def main():
                     app = None
                     _cs["valid"] = False
 
-            time.sleep(0.1)
+            time.sleep(0.01)   # 10 ms — keeps gesture queue drained at ~100 Hz
 
     except KeyboardInterrupt:
         log.info("Stopped by user.")
