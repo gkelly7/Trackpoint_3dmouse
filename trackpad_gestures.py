@@ -90,6 +90,12 @@ ZOOM_SENSITIVITY  = 1.5
 # Y-axis orbit: radians per radian of measured finger twist.
 TWIST_SENSITIVITY = 0.8
 
+# --- Motion direction flags ---
+# Set to True to flip the corresponding axis if it feels backwards.
+PAN_INVERT_X  = False   # flip left/right pan
+PAN_INVERT_Z  = False   # flip up/down pan
+ZOOM_INVERT   = True    # True = spread fingers → zoom in  (standard pinch)
+
 # Minimum distance between the two fingers (in logical units) before we treat
 # them as a valid two-finger gesture.  Filters accidental grazes.
 MIN_FINGER_SEPARATION = 50
@@ -433,6 +439,11 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
     """Apply one frame of gesture deltas to the Inventor camera."""
     global _apply_logged
 
+    # Apply direction inversions (configure at top of file)
+    if PAN_INVERT_X: pan_x = -pan_x
+    if PAN_INVERT_Z: pan_z = -pan_z
+    if ZOOM_INVERT:  zoom  = -zoom
+
     result = _active_view(app)
     if result is None:
         return
@@ -733,11 +744,17 @@ def main():
     app     = None
     last_reconnect = 0.0
     RECONNECT_INTERVAL = 2.0
-    finger_queue = _queue.Queue()
+
+    # Capped ring-buffer: holds at most 5 frames.
+    # If Inventor is slow, old frames are silently dropped so there is never
+    # more than ~50 ms of backlog and motion stops promptly on finger lift.
+    _finger_buf  = collections.deque(maxlen=5)
+    _finger_lock = threading.Lock()
 
     def on_fingers(fingers):
-        """Called from the TouchpadListener thread — only queue, never touch COM."""
-        finger_queue.put(fingers)
+        """Called from the TouchpadListener thread — only buffer, never touch COM."""
+        with _finger_lock:
+            _finger_buf.append(fingers)
 
     listener = TouchpadListener(on_fingers, debug_hid=args.debug_hid)
     listener.start()
@@ -759,27 +776,34 @@ def main():
                 else:
                     log.info("Waiting for Inventor...")
 
-            # Drain the gesture queue — apply_gesture runs here on the COM thread
-            while app is not None:
-                try:
-                    fingers = finger_queue.get_nowait()
-                except _queue.Empty:
-                    break
+            # Drain the finger buffer on the COM thread.
+            # Accumulate all queued deltas into ONE apply_gesture call so
+            # Inventor is only poked once per 10 ms tick — smooth & backlog-free.
+            with _finger_lock:
+                batch = list(_finger_buf)
+                _finger_buf.clear()
 
-                if len(fingers) == 2:
-                    log.debug("2-finger gesture: p1=(%d,%d) p2=(%d,%d)",
-                              fingers[0]["x_raw"], fingers[0]["y_raw"],
-                              fingers[1]["x_raw"], fingers[1]["y_raw"])
+            if batch and app is not None:
+                pan_x_t = pan_z_t = zoom_t = twist_t = 0.0
+                had_gesture = False
+                for fingers in batch:
+                    if len(fingers) == 2:
+                        log.debug("2-finger gesture: p1=(%d,%d) p2=(%d,%d)",
+                                  fingers[0]["x_raw"], fingers[0]["y_raw"],
+                                  fingers[1]["x_raw"], fingers[1]["y_raw"])
+                    result = gesture.process(fingers)
+                    if result is not None:
+                        pan_x_t  += result[0]
+                        pan_z_t  += result[1]
+                        zoom_t   += result[2]
+                        twist_t  += result[3]
+                        had_gesture = True
 
-                result = gesture.process(fingers)
-                if result is None:
-                    continue
-
-                pan_x, pan_z, zoom, twist_y = result
-                try:
-                    apply_gesture(app, pan_x, pan_z, zoom, twist_y)
-                except Exception as e:
-                    log.warning("apply_gesture failed: %s", e)
+                if had_gesture:
+                    try:
+                        apply_gesture(app, pan_x_t, pan_z_t, zoom_t, twist_t)
+                    except Exception as e:
+                        log.warning("apply_gesture failed: %s", e)
 
             # Heartbeat
             if now - _heartbeat >= 10.0:
@@ -797,7 +821,7 @@ def main():
                     app = None
                     _cs["valid"] = False
 
-            time.sleep(0.01)   # 10 ms — keeps gesture queue drained at ~100 Hz
+            time.sleep(0.01)   # 10 ms tick
 
     except KeyboardInterrupt:
         log.info("Stopped by user.")
