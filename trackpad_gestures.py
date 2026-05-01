@@ -95,6 +95,7 @@ TWIST_SENSITIVITY = 0.8
 PAN_INVERT_X  = False   # flip left/right pan
 PAN_INVERT_Z  = False   # flip up/down pan
 ZOOM_INVERT   = True    # True = spread fingers → zoom in  (standard pinch)
+TWIST_INVERT  = True    # True = flip rotation direction
 
 # Minimum distance between the two fingers (in logical units) before we treat
 # them as a valid two-finger gesture.  Filters accidental grazes.
@@ -457,9 +458,10 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
     global _apply_logged
 
     # Apply direction inversions (configure at top of file)
-    if PAN_INVERT_X: pan_x = -pan_x
-    if PAN_INVERT_Z: pan_z = -pan_z
-    if ZOOM_INVERT:  zoom  = -zoom
+    if PAN_INVERT_X:  pan_x   = -pan_x
+    if PAN_INVERT_Z:  pan_z   = -pan_z
+    if ZOOM_INVERT:   zoom    = -zoom
+    if TWIST_INVERT:  twist_y = -twist_y
 
     result = _active_view(app)
     if result is None:
@@ -497,15 +499,39 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
         target += delta
         changed = True
 
-    # --- Zoom (dolly: move eye along view axis, keep target fixed) ---
+    # --- Zoom ---
+    # Inventor defaults to orthographic projection.  In ortho mode, moving the
+    # eye along the view axis has zero visual effect — ViewScale must be adjusted
+    # instead.  In perspective mode the normal eye-dolly approach works.
     if zoom:
-        # zoom > 0 means fingers spread = zoom in (eye moves toward target)
-        dolly = fwd * (zoom * r * ZOOM_SENSITIVITY)
-        new_eye = eye + dolly
-        new_r   = np.linalg.norm(new_eye - target)
-        if new_r > 1e-4:   # don't allow eye to pass through target
-            eye = new_eye
-            changed = True
+        try:
+            is_perspective = cam.Perspective
+        except Exception:
+            is_perspective = False   # assume ortho if property not readable
+
+        if is_perspective:
+            # Perspective: dolly the eye toward / away from the target.
+            dolly   = fwd * (zoom * r * ZOOM_SENSITIVITY)
+            new_eye = eye + dolly
+            new_r   = np.linalg.norm(new_eye - target)
+            if new_r > 1e-4:
+                eye     = new_eye
+                changed = True
+        else:
+            # Orthographic: scale the view extent.
+            # zoom > 0 = spread = zoom in = smaller ViewScale value.
+            try:
+                vs = cam.ViewScale
+                # Use a multiplicative step so the feel is consistent at any
+                # zoom level.  ZOOM_SENSITIVITY of 1.5 with a typical pinch
+                # delta of ~0.05 gives ~7 % zoom per gesture tick.
+                factor    = 1.0 - zoom * ZOOM_SENSITIVITY
+                new_vs    = vs * max(factor, 0.01)   # clamp so we can't invert
+                cam.ViewScale = new_vs
+                changed = True
+                log.debug("ortho zoom: ViewScale %.4f → %.4f", vs, new_vs)
+            except Exception as e:
+                log.debug("ViewScale adjust failed: %s", e)
 
     # --- Orbit Y (twist around world-up axis, keeping target fixed) ---
     if twist_y:
