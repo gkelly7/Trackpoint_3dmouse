@@ -94,7 +94,7 @@ TWIST_SENSITIVITY = 0.8
 # Set to True to flip the corresponding axis if it feels backwards.
 PAN_INVERT_X  = False   # flip left/right pan
 PAN_INVERT_Z  = False   # flip up/down pan
-ZOOM_INVERT   = True    # True = spread fingers → zoom in  (standard pinch)
+ZOOM_INVERT   = False   # True = spread fingers → zoom in  (standard pinch)
 TWIST_INVERT  = True    # True = flip rotation direction
 
 # Single-finger orbit sensitivity (radians per full pad width / height).
@@ -444,15 +444,17 @@ class GestureRecognizer:
             self._prev_1x = self._prev_cx = None   # invalidate both
             self._last_count = count
 
-        # ---- single finger: orbit ----
-        if count == 1:
-            x, y = fingers[0]["x"], fingers[0]["y"]
+        # ---- three fingers: orbit ----
+        if count == 3:
+            # Track centroid of all three fingers as the orbit reference.
+            cx = sum(f["x"] for f in fingers) / 3.0
+            cy = sum(f["y"] for f in fingers) / 3.0
             if self._prev_1x is None:
-                self._prev_1x, self._prev_1y = x, y
+                self._prev_1x, self._prev_1y = cx, cy
                 return None
-            dx = x - self._prev_1x
-            dy = y - self._prev_1y
-            self._prev_1x, self._prev_1y = x, y
+            dx = cx - self._prev_1x
+            dy = cy - self._prev_1y
+            self._prev_1x, self._prev_1y = cx, cy
             return {"type": "orbit", "dx": dx, "dy": dy}
 
         # ---- two fingers: pan / zoom / twist ----
@@ -565,29 +567,31 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
                 eye     = new_eye
                 changed = True
         else:
-            # Orthographic: scale the view extent.
-            # zoom > 0 = spread = zoom in = smaller ViewScale value.
-            # We capture the new value here but apply it AFTER cam.Eye/Target/
-            # UpVector are set, otherwise those assignments reset ViewScale.
+            # Orthographic: scale the view extent via app.ActiveView.Scale.
+            # cam.ViewScale does not exist on the Camera dispatch object in
+            # Inventor 2024; the scale property lives on the View object.
+            # We record the desired value here and apply it after _apply_cam()
+            # so that writing cam.Eye/Target doesn't override the new scale.
             try:
-                vs          = cam.ViewScale
+                vs          = app.ActiveView.Scale
                 factor      = 1.0 - zoom * ZOOM_SENSITIVITY
                 _pending_vs = vs * max(factor, 0.01)
                 changed     = True
-                log.debug("ortho zoom: ViewScale %.4f → %.4f", vs, _pending_vs)
+                log.debug("ortho zoom: View.Scale %.4f → %.4f", vs, _pending_vs)
             except Exception as e:
-                log.debug("ViewScale adjust failed: %s", e)
+                log.debug("ortho zoom failed: %s", e)
 
-    # --- Orbit Y (twist around world-up axis, keeping target fixed) ---
+    # --- Orbit Y (twist around camera-up axis, keeping target fixed) ---
+    # Use 'up' (camera up vector) as the rotation axis, not hardcoded world Y.
+    # This keeps rotation screen-aligned regardless of model orientation or
+    # whether the project uses Y-up or Z-up conventions.
     if twist_y:
-        world_up = np.array([0.0, 1.0, 0.0])
-        angle    = twist_y * TWIST_SENSITIVITY
-        offset   = eye - target
-        offset   = _rodrigues(offset, world_up, angle)
-        up       = _rodrigues(up,     world_up, angle)
-        up      /= np.linalg.norm(up)
-        eye      = target + offset
-        changed  = True
+        angle  = twist_y * TWIST_SENSITIVITY
+        offset = eye - target
+        offset = _rodrigues(offset, up, angle)
+        # Rotating around 'up' leaves 'up' unchanged — no need to update it
+        eye    = target + offset
+        changed = True
 
     if not changed:
         return
@@ -601,9 +605,13 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
     cam.UpVector = tg.CreateUnitVector(float(up[0]),     float(up[1]),     float(up[2]))
     cam.Eye      = tg.CreatePoint(float(eye[0]),    float(eye[1]),    float(eye[2]))
     cam.Target   = tg.CreatePoint(float(target[0]), float(target[1]), float(target[2]))
-    if _pending_vs is not None:
-        cam.ViewScale = _pending_vs
     _apply_cam(cam)
+    # Ortho zoom: app.ActiveView.Scale must be set AFTER cam.Apply()
+    if _pending_vs is not None:
+        try:
+            app.ActiveView.Scale = _pending_vs
+        except Exception as e:
+            log.debug("ortho zoom apply failed: %s", e)
 
     if not _apply_logged:
         log.info("First gesture applied to Inventor.")
@@ -611,7 +619,7 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
 
 
 def apply_orbit(app, dx, dy):
-    """Apply one-finger orbit deltas to the Inventor camera."""
+    """Apply three-finger orbit deltas to the Inventor camera."""
     if ORBIT_INVERT_H: dx = -dx
     if ORBIT_INVERT_V: dy = -dy
 
@@ -637,14 +645,16 @@ def apply_orbit(app, dx, dy):
         return
     right /= right_len
 
-    world_up = np.array([0.0, 1.0, 0.0])
-    angle_h  = -dx * ORBIT_SENSITIVITY_H   # negative: drag right → orbit right
-    angle_v  =  dy * ORBIT_SENSITIVITY_V   # positive: drag down  → tilt down
+    angle_h = -dx * ORBIT_SENSITIVITY_H   # drag right → orbit right
+    angle_v =  dy * ORBIT_SENSITIVITY_V   # drag down  → tilt down
 
-    # Horizontal orbit around world-up (turntable)
+    # Horizontal orbit around camera-up (screen-aligned turntable).
+    # Using 'up' instead of world [0,1,0] keeps rotation correct regardless
+    # of model orientation (Y-up vs Z-up, or any tilted view).
     offset = eye - target
-    offset = _rodrigues(offset, world_up, angle_h)
-    up_new = _rodrigues(up,     world_up, angle_h)
+    offset = _rodrigues(offset, up, angle_h)
+    # Rotating around 'up' leaves 'up' unchanged — no update needed.
+    up_new = up.copy()
 
     # Vertical orbit around camera-right (tilt)
     offset = _rodrigues(offset, right, angle_v)
@@ -655,10 +665,17 @@ def apply_orbit(app, dx, dy):
     r_new = np.linalg.norm(eye - target)
     _cs.update(eye=eye, target=target, up=up_new, r=r_new, last_t=now, valid=True)
 
+    # Freeze the cursor so the touchpad finger motion doesn't visibly
+    # move the pointer while orbiting.
+    saved_pt = ctypes.wintypes.POINT()
+    _u32.GetCursorPos(ctypes.byref(saved_pt))
+
     cam.UpVector = tg.CreateUnitVector(float(up_new[0]), float(up_new[1]), float(up_new[2]))
     cam.Eye      = tg.CreatePoint(float(eye[0]),    float(eye[1]),    float(eye[2]))
     cam.Target   = tg.CreatePoint(float(target[0]), float(target[1]), float(target[2]))
     _apply_cam(cam)
+
+    _u32.SetCursorPos(saved_pt.x, saved_pt.y)
 
 
 # ---------------------------------------------------------------------------
@@ -833,6 +850,19 @@ def _is_elevated() -> bool:
 # ---------------------------------------------------------------------------
 # Inventor connection
 # ---------------------------------------------------------------------------
+def _inventor_is_foreground() -> bool:
+    """True when an Inventor window is the current foreground window."""
+    try:
+        hwnd = _u32.GetForegroundWindow()
+        if not hwnd:
+            return False
+        buf = ctypes.create_unicode_buffer(512)
+        _u32.GetWindowTextW(hwnd, buf, 512)
+        return "Inventor" in buf.value
+    except Exception:
+        return True   # fail open — apply gesture rather than drop it
+
+
 def get_inventor():
     try:
         return win32com.client.GetActiveObject("Inventor.Application")
@@ -919,36 +949,40 @@ def main():
                 _finger_buf.clear()
 
             if batch and app is not None:
-                pan_x_t = pan_z_t = zoom_t = twist_t = 0.0
-                orbit_dx = orbit_dy = 0.0
-                had_gesture = had_orbit = False
+                # Skip gesture processing when Inventor is not in the foreground.
+                if not _inventor_is_foreground():
+                    gesture.reset()
+                else:
+                    pan_x_t = pan_z_t = zoom_t = twist_t = 0.0
+                    orbit_dx = orbit_dy = 0.0
+                    had_gesture = had_orbit = False
 
-                for fingers in batch:
-                    result = gesture.process(fingers)
-                    if result is None:
-                        continue
-                    if result["type"] == "orbit":
-                        orbit_dx   += result["dx"]
-                        orbit_dy   += result["dy"]
-                        had_orbit   = True
-                    elif result["type"] == "gesture":
-                        pan_x_t    += result["pan_x"]
-                        pan_z_t    += result["pan_z"]
-                        zoom_t     += result["zoom"]
-                        twist_t    += result["twist_y"]
-                        had_gesture = True
+                    for fingers in batch:
+                        result = gesture.process(fingers)
+                        if result is None:
+                            continue
+                        if result["type"] == "orbit":
+                            orbit_dx   += result["dx"]
+                            orbit_dy   += result["dy"]
+                            had_orbit   = True
+                        elif result["type"] == "gesture":
+                            pan_x_t    += result["pan_x"]
+                            pan_z_t    += result["pan_z"]
+                            zoom_t     += result["zoom"]
+                            twist_t    += result["twist_y"]
+                            had_gesture = True
 
-                if had_orbit:
-                    try:
-                        apply_orbit(app, orbit_dx, orbit_dy)
-                    except Exception as e:
-                        log.warning("apply_orbit failed: %s", e)
+                    if had_orbit:
+                        try:
+                            apply_orbit(app, orbit_dx, orbit_dy)
+                        except Exception as e:
+                            log.warning("apply_orbit failed: %s", e)
 
-                if had_gesture:
-                    try:
-                        apply_gesture(app, pan_x_t, pan_z_t, zoom_t, twist_t)
-                    except Exception as e:
-                        log.warning("apply_gesture failed: %s", e)
+                    if had_gesture:
+                        try:
+                            apply_gesture(app, pan_x_t, pan_z_t, zoom_t, twist_t)
+                        except Exception as e:
+                            log.warning("apply_gesture failed: %s", e)
 
             # Heartbeat
             if now - _heartbeat >= 10.0:
