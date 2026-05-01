@@ -97,6 +97,13 @@ PAN_INVERT_Z  = False   # flip up/down pan
 ZOOM_INVERT   = True    # True = spread fingers → zoom in  (standard pinch)
 TWIST_INVERT  = True    # True = flip rotation direction
 
+# Single-finger orbit sensitivity (radians per full pad width / height).
+# 2.0 → dragging one full pad width rotates the model ~115°.
+ORBIT_SENSITIVITY_H = 2.0
+ORBIT_SENSITIVITY_V = 2.0
+ORBIT_INVERT_H      = False   # flip horizontal orbit direction
+ORBIT_INVERT_V      = False   # flip vertical   orbit direction
+
 # Minimum distance between the two fingers (in logical units) before we treat
 # them as a valid two-finger gesture.  Filters accidental grazes.
 MIN_FINGER_SEPARATION = 50
@@ -230,6 +237,16 @@ class RAWINPUT_HID(ctypes.Structure):
 SIZEOF_RAWINPUT_HID = ctypes.sizeof(RAWINPUT_HID)
 
 _u32 = ctypes.windll.user32
+
+# Declare Win32 API functions with pointer-sized types so 64-bit lParam values
+# don't overflow on x64 Windows (c_long in wintypes is 32-bit even on 64-bit).
+_u32.CallNextHookEx.restype  = ctypes.c_ssize_t
+_u32.CallNextHookEx.argtypes = [
+    ctypes.wintypes.HANDLE,  # hhk (can be NULL)
+    ctypes.c_int,            # nCode
+    ctypes.c_size_t,         # wParam (UINT_PTR — 64-bit on x64)
+    ctypes.c_ssize_t,        # lParam (LONG_PTR — 64-bit on x64)
+]
 
 # WNDCLASSW must be defined manually — ctypes.wintypes does not include it.
 #
@@ -376,75 +393,105 @@ class WPTParser:
 # ---------------------------------------------------------------------------
 class GestureRecognizer:
     """
-    Converts per-frame finger lists into (pan_x, pan_z, zoom_delta, twist_y).
+    Per-frame finger list → gesture dict.
+
+    1 finger  → {"type": "orbit",   "dx": float, "dy": float}
+    2 fingers → {"type": "gesture", "pan_x": float, "pan_z": float,
+                                    "zoom": float,  "twist_y": float}
+    other     → None
 
     Coordinate conventions (before Inventor mapping):
-        pan_x   : positive = fingers moved right
-        pan_z   : positive = fingers moved down (towards user)
-        zoom    : positive = fingers spread apart (zoom in)
-        twist_y : positive = fingers rotated counter-clockwise (orbit left)
+        orbit dx    : positive = finger moved right
+        orbit dy    : positive = finger moved down
+        pan_x       : positive = centroid moved right
+        pan_z       : positive = centroid moved down
+        zoom        : positive = fingers spread apart (zoom in)
+        twist_y     : positive = fingers rotated counter-clockwise
     """
 
     def __init__(self):
         self.reset()
 
     def reset(self):
-        self._prev_cx   = None
-        self._prev_cy   = None
-        self._prev_dist = None
-        self._prev_ang  = None
-        self._last_seen = 0.0
+        # 1-finger state
+        self._prev_1x    = None
+        self._prev_1y    = None
+        # 2-finger state
+        self._prev_cx    = None
+        self._prev_cy    = None
+        self._prev_dist  = None
+        self._prev_ang   = None
+        # shared
+        self._last_count = 0
+        self._last_seen  = 0.0
 
-    def process(self, fingers: list) -> tuple | None:
-        """
-        Call once per raw-input event with the current active finger list.
-        Returns (pan_x, pan_z, zoom, twist_y) deltas, or None if no valid
-        two-finger gesture.
-        """
-        now = time.monotonic()
+    def process(self, fingers: list) -> dict | None:
+        now   = time.monotonic()
+        count = len(fingers)
 
-        if len(fingers) != 2:
-            # Debounce: allow brief gaps (finger re-contact on edge of pad)
-            if fingers and now - self._last_seen < LIFTOFF_DEBOUNCE:
-                return None  # keep state; might recover within debounce window
+        # All-lift: debounce briefly then reset
+        if count == 0:
+            if now - self._last_seen < LIFTOFF_DEBOUNCE:
+                return None
             self.reset()
             return None
 
         self._last_seen = now
 
-        p1, p2 = fingers[0], fingers[1]
-        sep = math.hypot(p2["x_raw"] - p1["x_raw"],
-                         p2["y_raw"] - p1["y_raw"])
-        if sep < MIN_FINGER_SEPARATION:
-            self.reset()
-            return None
+        # Finger-count change: clear old state so first frame of new gesture
+        # just records the baseline (no spurious jump).
+        if count != self._last_count:
+            self._prev_1x = self._prev_cx = None   # invalidate both
+            self._last_count = count
 
-        cx = (p1["x"] + p2["x"]) * 0.5
-        cy = (p1["y"] + p2["y"]) * 0.5
-        dist = math.hypot(p2["x"] - p1["x"], p2["y"] - p1["y"])
-        ang  = math.atan2(p2["y"] - p1["y"], p2["x"] - p1["x"])
+        # ---- single finger: orbit ----
+        if count == 1:
+            x, y = fingers[0]["x"], fingers[0]["y"]
+            if self._prev_1x is None:
+                self._prev_1x, self._prev_1y = x, y
+                return None
+            dx = x - self._prev_1x
+            dy = y - self._prev_1y
+            self._prev_1x, self._prev_1y = x, y
+            return {"type": "orbit", "dx": dx, "dy": dy}
 
-        if self._prev_cx is None:
-            # First frame — record baseline, emit nothing
+        # ---- two fingers: pan / zoom / twist ----
+        if count == 2:
+            p1, p2 = fingers[0], fingers[1]
+            sep = math.hypot(p2["x_raw"] - p1["x_raw"],
+                             p2["y_raw"] - p1["y_raw"])
+            if sep < MIN_FINGER_SEPARATION:
+                self._prev_cx = None
+                return None
+
+            cx   = (p1["x"] + p2["x"]) * 0.5
+            cy   = (p1["y"] + p2["y"]) * 0.5
+            dist = math.hypot(p2["x"] - p1["x"], p2["y"] - p1["y"])
+            ang  = math.atan2(p2["y"] - p1["y"], p2["x"] - p1["x"])
+
+            if self._prev_cx is None:
+                self._prev_cx, self._prev_cy = cx, cy
+                self._prev_dist = dist
+                self._prev_ang  = ang
+                return None
+
+            pan_x = cx - self._prev_cx
+            pan_z = cy - self._prev_cy
+            zoom  = dist - self._prev_dist
+            d_ang = ang - self._prev_ang
+            if d_ang >  math.pi: d_ang -= 2 * math.pi
+            if d_ang < -math.pi: d_ang += 2 * math.pi
+
             self._prev_cx, self._prev_cy = cx, cy
             self._prev_dist = dist
             self._prev_ang  = ang
-            return None
+            return {"type": "gesture",
+                    "pan_x": pan_x, "pan_z": pan_z,
+                    "zoom": zoom,   "twist_y": d_ang}
 
-        pan_x = cx - self._prev_cx
-        pan_z = cy - self._prev_cy
-        zoom  = dist - self._prev_dist
-
-        d_ang = ang - self._prev_ang
-        # Wrap to [-π, π]
-        if d_ang >  math.pi: d_ang -= 2 * math.pi
-        if d_ang < -math.pi: d_ang += 2 * math.pi
-
-        self._prev_cx, self._prev_cy = cx, cy
-        self._prev_dist = dist
-        self._prev_ang  = ang
-
-        return pan_x, pan_z, zoom, d_ang
+        # 3+ fingers: ignore
+        self.reset()
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +550,7 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
     # Inventor defaults to orthographic projection.  In ortho mode, moving the
     # eye along the view axis has zero visual effect — ViewScale must be adjusted
     # instead.  In perspective mode the normal eye-dolly approach works.
+    _pending_vs = None   # set below if we're in ortho mode; applied LAST
     if zoom:
         try:
             is_perspective = cam.Perspective
@@ -510,7 +558,6 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
             is_perspective = False   # assume ortho if property not readable
 
         if is_perspective:
-            # Perspective: dolly the eye toward / away from the target.
             dolly   = fwd * (zoom * r * ZOOM_SENSITIVITY)
             new_eye = eye + dolly
             new_r   = np.linalg.norm(new_eye - target)
@@ -520,16 +567,14 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
         else:
             # Orthographic: scale the view extent.
             # zoom > 0 = spread = zoom in = smaller ViewScale value.
+            # We capture the new value here but apply it AFTER cam.Eye/Target/
+            # UpVector are set, otherwise those assignments reset ViewScale.
             try:
-                vs = cam.ViewScale
-                # Use a multiplicative step so the feel is consistent at any
-                # zoom level.  ZOOM_SENSITIVITY of 1.5 with a typical pinch
-                # delta of ~0.05 gives ~7 % zoom per gesture tick.
-                factor    = 1.0 - zoom * ZOOM_SENSITIVITY
-                new_vs    = vs * max(factor, 0.01)   # clamp so we can't invert
-                cam.ViewScale = new_vs
-                changed = True
-                log.debug("ortho zoom: ViewScale %.4f → %.4f", vs, new_vs)
+                vs          = cam.ViewScale
+                factor      = 1.0 - zoom * ZOOM_SENSITIVITY
+                _pending_vs = vs * max(factor, 0.01)
+                changed     = True
+                log.debug("ortho zoom: ViewScale %.4f → %.4f", vs, _pending_vs)
             except Exception as e:
                 log.debug("ViewScale adjust failed: %s", e)
 
@@ -547,18 +592,73 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
     if not changed:
         return
 
-    # Write back
+    # Write back — Eye/Target/UpVector first, ViewScale last.
+    # Setting Eye/Target can reset ViewScale internally in Inventor, so ortho
+    # zoom must be applied after the positional properties.
     r_new = np.linalg.norm(eye - target)
     _cs.update(eye=eye, target=target, up=up, r=r_new, last_t=now, valid=True)
 
     cam.UpVector = tg.CreateUnitVector(float(up[0]),     float(up[1]),     float(up[2]))
     cam.Eye      = tg.CreatePoint(float(eye[0]),    float(eye[1]),    float(eye[2]))
     cam.Target   = tg.CreatePoint(float(target[0]), float(target[1]), float(target[2]))
+    if _pending_vs is not None:
+        cam.ViewScale = _pending_vs
     _apply_cam(cam)
 
     if not _apply_logged:
         log.info("First gesture applied to Inventor.")
         _apply_logged = True
+
+
+def apply_orbit(app, dx, dy):
+    """Apply one-finger orbit deltas to the Inventor camera."""
+    if ORBIT_INVERT_H: dx = -dx
+    if ORBIT_INVERT_V: dy = -dy
+
+    result = _active_view(app)
+    if result is None:
+        return
+    cam, tg = result
+
+    now = time.monotonic()
+    if not _cs["valid"] or (now - _cs["last_t"]) > RESYNC_IDLE:
+        if not _read_cam(cam):
+            return
+
+    eye    = _cs["eye"].copy()
+    target = _cs["target"].copy()
+    up     = _cs["up"].copy()
+
+    fwd   = (target - eye)
+    fwd  /= np.linalg.norm(fwd)
+    right = np.cross(fwd, up)
+    right_len = np.linalg.norm(right)
+    if right_len < 1e-9:
+        return
+    right /= right_len
+
+    world_up = np.array([0.0, 1.0, 0.0])
+    angle_h  = -dx * ORBIT_SENSITIVITY_H   # negative: drag right → orbit right
+    angle_v  =  dy * ORBIT_SENSITIVITY_V   # positive: drag down  → tilt down
+
+    # Horizontal orbit around world-up (turntable)
+    offset = eye - target
+    offset = _rodrigues(offset, world_up, angle_h)
+    up_new = _rodrigues(up,     world_up, angle_h)
+
+    # Vertical orbit around camera-right (tilt)
+    offset = _rodrigues(offset, right, angle_v)
+    up_new = _rodrigues(up_new, right, angle_v)
+    up_new /= np.linalg.norm(up_new)
+
+    eye   = target + offset
+    r_new = np.linalg.norm(eye - target)
+    _cs.update(eye=eye, target=target, up=up_new, r=r_new, last_t=now, valid=True)
+
+    cam.UpVector = tg.CreateUnitVector(float(up_new[0]), float(up_new[1]), float(up_new[2]))
+    cam.Eye      = tg.CreatePoint(float(eye[0]),    float(eye[1]),    float(eye[2]))
+    cam.Target   = tg.CreatePoint(float(target[0]), float(target[1]), float(target[2]))
+    _apply_cam(cam)
 
 
 # ---------------------------------------------------------------------------
@@ -730,28 +830,6 @@ def _is_elevated() -> bool:
         return False
 
 
-def _relaunch_nonadmin(extra_args: list) -> None:
-    """
-    Relaunch THIS script at medium (non-admin) integrity by going through
-    Shell.Application.ShellExecute, which always inherits Explorer's token
-    rather than the caller's elevated token.
-    The current (elevated) process exits immediately after spawning.
-    """
-    import shlex
-    script   = os.path.abspath(__file__)
-    all_args = [f'"{script}"'] + [shlex.quote(a) for a in extra_args]
-    cmd_args = " ".join(all_args)
-    log.info("Re-launching non-elevated: %s %s", sys.executable, cmd_args)
-    try:
-        shell = win32com.client.Dispatch("Shell.Application")
-        shell.ShellExecute(sys.executable, cmd_args,
-                           os.path.dirname(script), "", 1)
-    except Exception as e:
-        log.error("ShellExecute relaunch failed: %s", e)
-        log.error("Please close this window and re-run from a normal "
-                  "(non-Administrator) command prompt.")
-
-
 # ---------------------------------------------------------------------------
 # Inventor connection
 # ---------------------------------------------------------------------------
@@ -771,35 +849,18 @@ def main():
     parser = argparse.ArgumentParser(description="Trackpad gesture Inventor controller")
     parser.add_argument("--debug-hid", action="store_true",
                         help="Print every raw HID report to the log (for layout calibration)")
-    parser.add_argument("--no-relaunch", action="store_true",
-                        help="Skip automatic non-elevated relaunch (use if relaunch loops)")
     args = parser.parse_args()
 
     pythoncom.CoInitialize()
 
-    # -----------------------------------------------------------------------
-    # Elevation guard
-    # Inventor runs at medium integrity (non-elevated).  A Python process
-    # running as Administrator cannot see Inventor in the Windows ROT, so
-    # GetActiveObject will always fail with MK_E_UNAVAILABLE (0x800401E3).
-    # Automatically re-launch through Shell.Application to shed elevation.
-    # -----------------------------------------------------------------------
+    # Inventor must be accessible via COM (GetActiveObject / Windows ROT).
+    # If Inventor runs elevated (as Administrator), this script must also run
+    # elevated — both processes must be at the same integrity level.
     if _is_elevated():
-        if args.no_relaunch:
-            log.warning(
-                "Running as Administrator but --no-relaunch is set. "
-                "GetActiveObject will likely fail. "
-                "Run from a normal (non-admin) command prompt instead."
-            )
-        else:
-            log.warning("Detected elevated (Administrator) process. "
-                        "Relaunching non-elevated so Inventor is visible...")
-            forward = sys.argv[1:]          # pass through all original flags
-            if "--no-relaunch" not in forward:
-                forward.append("--no-relaunch")   # prevent re-launch loop
-            _relaunch_nonadmin(forward)
-            pythoncom.CoUninitialize()
-            sys.exit(0)
+        log.info("Running as Administrator.")
+    else:
+        log.info("Running as standard user. "
+                 "If Inventor is elevated, start this script from an admin prompt.")
 
     log.info("Trackpad gesture controller starting.")
     log.info("Pan sensitivity: %.6f  Zoom: %.6f  Twist: %.4f",
@@ -859,19 +920,29 @@ def main():
 
             if batch and app is not None:
                 pan_x_t = pan_z_t = zoom_t = twist_t = 0.0
-                had_gesture = False
+                orbit_dx = orbit_dy = 0.0
+                had_gesture = had_orbit = False
+
                 for fingers in batch:
-                    if len(fingers) == 2:
-                        log.debug("2-finger gesture: p1=(%d,%d) p2=(%d,%d)",
-                                  fingers[0]["x_raw"], fingers[0]["y_raw"],
-                                  fingers[1]["x_raw"], fingers[1]["y_raw"])
                     result = gesture.process(fingers)
-                    if result is not None:
-                        pan_x_t  += result[0]
-                        pan_z_t  += result[1]
-                        zoom_t   += result[2]
-                        twist_t  += result[3]
+                    if result is None:
+                        continue
+                    if result["type"] == "orbit":
+                        orbit_dx   += result["dx"]
+                        orbit_dy   += result["dy"]
+                        had_orbit   = True
+                    elif result["type"] == "gesture":
+                        pan_x_t    += result["pan_x"]
+                        pan_z_t    += result["pan_z"]
+                        zoom_t     += result["zoom"]
+                        twist_t    += result["twist_y"]
                         had_gesture = True
+
+                if had_orbit:
+                    try:
+                        apply_orbit(app, orbit_dx, orbit_dy)
+                    except Exception as e:
+                        log.warning("apply_orbit failed: %s", e)
 
                 if had_gesture:
                     try:
