@@ -851,14 +851,20 @@ def _is_elevated() -> bool:
 # Inventor connection
 # ---------------------------------------------------------------------------
 def _inventor_is_foreground() -> bool:
-    """True when an Inventor window is the current foreground window."""
+    """
+    True when an Inventor window (or any ancestor/child) has keyboard focus.
+    Walks up the parent chain because Inventor child widgets (toolbars, panels,
+    viewport) have focus but their own window title may be empty.
+    """
     try:
         hwnd = _u32.GetForegroundWindow()
-        if not hwnd:
-            return False
-        buf = ctypes.create_unicode_buffer(512)
-        _u32.GetWindowTextW(hwnd, buf, 512)
-        return "Inventor" in buf.value
+        buf  = ctypes.create_unicode_buffer(512)
+        while hwnd:
+            _u32.GetWindowTextW(hwnd, buf, 512)
+            if "Inventor" in buf.value:
+                return True
+            hwnd = _u32.GetParent(hwnd)
+        return False
     except Exception:
         return True   # fail open — apply gesture rather than drop it
 
@@ -951,6 +957,11 @@ def main():
             if batch and app is not None:
                 # Skip gesture processing when Inventor is not in the foreground.
                 if not _inventor_is_foreground():
+                    if log.isEnabledFor(logging.DEBUG):
+                        hwnd = _u32.GetForegroundWindow()
+                        buf  = ctypes.create_unicode_buffer(256)
+                        _u32.GetWindowTextW(hwnd, buf, 256)
+                        log.debug("gesture skipped: foreground='%s'", buf.value)
                     gesture.reset()
                 else:
                     pan_x_t = pan_z_t = zoom_t = twist_t = 0.0
