@@ -99,10 +99,10 @@ TWIST_INVERT  = True    # True = flip rotation direction
 
 # Single-finger orbit sensitivity (radians per full pad width / height).
 # 2.0 → dragging one full pad width rotates the model ~115°.
-ORBIT_SENSITIVITY_H = 2.0
-ORBIT_SENSITIVITY_V = 2.0
+ORBIT_SENSITIVITY_H = 3.0
+ORBIT_SENSITIVITY_V = 3.0
 ORBIT_INVERT_H      = False   # flip horizontal orbit direction
-ORBIT_INVERT_V      = False   # flip vertical   orbit direction
+ORBIT_INVERT_V      = True   # flip vertical   orbit direction
 
 # Minimum distance between the two fingers (in logical units) before we treat
 # them as a valid two-finger gesture.  Filters accidental grazes.
@@ -111,6 +111,13 @@ MIN_FINGER_SEPARATION = 50
 # How long (seconds) a finger must be continuously absent before we consider
 # the gesture ended and reset gesture state.
 LIFTOFF_DEBOUNCE = 0.08
+
+# How long (seconds) after the last HID report before the cursor/scroll
+# suppression hooks are force-released.  Many WPT drivers do NOT send a
+# final count=0 report on finger lift — they just stop sending — so the
+# flags would otherwise stay set forever.  120 ms is safely above the
+# ~10 ms WPT report interval but quick enough to feel instant on release.
+LIFTOFF_WATCHDOG = 0.12
 
 # ---------------------------------------------------------------------------
 # Inventor document type constants
@@ -554,10 +561,12 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
         changed = True
 
     # --- Zoom ---
-    # Inventor defaults to orthographic projection.  In ortho mode, moving the
-    # eye along the view axis has zero visual effect — ViewScale must be adjusted
-    # instead.  In perspective mode the normal eye-dolly approach works.
-    _pending_vs = None   # set below if we're in ortho mode; applied LAST
+    # Perspective mode: dolly the eye along the view axis.
+    # Orthographic mode: adjust cam.ViewScale (the Camera object's own scale
+    #   property) BEFORE calling Apply() so it is committed in one shot.
+    #   Fallback: app.ActiveView.Scale post-apply (DrawingView-style API,
+    #   less reliable for 3D views but kept as a safety net).
+    _pending_vs = None
     if zoom:
         try:
             is_perspective = cam.Perspective
@@ -572,19 +581,23 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
                 eye     = new_eye
                 changed = True
         else:
-            # Orthographic: scale the view extent via app.ActiveView.Scale.
-            # cam.ViewScale does not exist on the Camera dispatch object in
-            # Inventor 2024; the scale property lives on the View object.
-            # We record the desired value here and apply it after _apply_cam()
-            # so that writing cam.Eye/Target doesn't override the new scale.
+            factor = 1.0 - zoom * ZOOM_SENSITIVITY
             try:
-                vs          = app.ActiveView.Scale
-                factor      = 1.0 - zoom * ZOOM_SENSITIVITY
-                _pending_vs = vs * max(factor, 0.01)
-                changed     = True
-                log.debug("ortho zoom: View.Scale %.4f → %.4f", vs, _pending_vs)
-            except Exception as e:
-                log.debug("ortho zoom failed: %s", e)
+                vs = cam.ViewScale
+                new_vs = vs * max(factor, 0.01)
+                cam.ViewScale = new_vs
+                changed = True
+                log.debug("ortho zoom: cam.ViewScale %.4f → %.4f", vs, new_vs)
+            except Exception as e1:
+                # cam.ViewScale not available on this Inventor build — try View.Scale
+                log.debug("cam.ViewScale unavailable (%s), trying ActiveView.Scale", e1)
+                try:
+                    vs = app.ActiveView.Scale
+                    _pending_vs = vs * max(factor, 0.01)
+                    changed = True
+                    log.debug("ortho zoom: ActiveView.Scale %.4f → %.4f", vs, _pending_vs)
+                except Exception as e2:
+                    log.debug("ortho zoom failed entirely: %s", e2)
 
     # --- Roll (two-finger twist → rotate around the camera's forward/view axis) ---
     # Spinning two fingers around the pad centre maps naturally to rolling the
@@ -925,18 +938,29 @@ def main():
     # more than ~50 ms of backlog and motion stops promptly on finger lift.
     _finger_buf  = collections.deque(maxlen=5)
     _finger_lock = threading.Lock()
+    _last_touch_t = [0.0]   # time of last non-empty HID report (for watchdog)
 
     def on_fingers(fingers):
         """Called from the TouchpadListener thread — only buffer, never touch COM."""
         n = len(fingers)
-        # Keep the scroll-block and cursor-block flags in sync with finger count.
-        # The LL mouse hook (same thread) reads these before forwarding events.
+        now_t = time.monotonic()
+
+        # Detect gesture start (transition from idle → active).
+        # Invalidate the camera cache so the first apply_orbit / apply_gesture
+        # always re-reads the current camera from Inventor instead of replaying
+        # a stale position that could jump the model.
+        was_active = _single_finger_active.is_set() or _two_fingers_active.is_set()
+        if n > 0 and not was_active:
+            _cs["valid"] = False
+
         if n >= 2:
             _two_fingers_active.set()
             _single_finger_active.clear()
+            _last_touch_t[0] = now_t
         elif n == 1:
             _single_finger_active.set()
             _two_fingers_active.clear()
+            _last_touch_t[0] = now_t
         else:
             _single_finger_active.clear()
             _two_fingers_active.clear()
@@ -1026,6 +1050,19 @@ def main():
                     log.info("Lost connection to Inventor.")
                     app = None
                     _cs["valid"] = False
+
+            # Watchdog: if no HID touch data for LIFTOFF_WATCHDOG seconds,
+            # force-clear the cursor/scroll suppression flags.  Many WPT
+            # drivers stop sending reports on lift without a final count=0
+            # report, which would otherwise permanently block the mouse cursor.
+            if _single_finger_active.is_set() or _two_fingers_active.is_set():
+                if (now - _last_touch_t[0]) > LIFTOFF_WATCHDOG:
+                    log.debug("watchdog: releasing touch flags "
+                              "(%.0f ms since last HID report)",
+                              (now - _last_touch_t[0]) * 1000)
+                    _single_finger_active.clear()
+                    _two_fingers_active.clear()
+                    gesture.reset()
 
             time.sleep(0.01)   # 10 ms tick
 
