@@ -1095,28 +1095,29 @@ def main():
         n = len(fingers)
         now_t = time.monotonic()
 
-        # Suppress cursor/scroll only when BOTH conditions are true:
-        #   1. AHK is in Desk Mode (_3d_mode_active) — or standalone (default True)
-        #   2. Inventor is the foreground window
-        # In Couch/Kid Mode the touchpad must behave completely normally.
-        active_3d = _3d_mode_active.is_set() and _inventor_is_foreground()
+        # Desk Mode (_3d_mode_active set): suppress ALL touchpad cursor/scroll
+        # events regardless of what app is in front — trackpad is dead outside
+        # Inventor, and is a 3D mouse inside it.
+        # Couch/Kid Mode (_3d_mode_active clear): never suppress anything;
+        # touchpad behaves as a normal mouse everywhere.
+        in_3d_mode = _3d_mode_active.is_set()
 
         was_active = _single_finger_active.is_set() or _two_fingers_active.is_set()
 
-        if n >= 2 and active_3d:
+        if n >= 2 and in_3d_mode:
             _two_fingers_active.set()
             _single_finger_active.clear()
             _last_touch_t[0] = now_t
             if not was_active:
                 _cs["valid"] = False
-        elif n == 1 and active_3d:
+        elif n == 1 and in_3d_mode:
             _single_finger_active.set()
             _two_fingers_active.clear()
             _last_touch_t[0] = now_t
             if not was_active:
                 _cs["valid"] = False
         else:
-            # Couch/Kid Mode OR Inventor not in front — pass all events through.
+            # Couch/Kid Mode or no fingers — never suppress.
             _single_finger_active.clear()
             _two_fingers_active.clear()
 
