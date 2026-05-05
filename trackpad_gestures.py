@@ -161,7 +161,11 @@ _cs = {
     "last_t": 0.0,
 }
 
-RESYNC_IDLE = 0.5  # re-read camera from Inventor after this many seconds idle
+# Scale factor converting a pinch zoom_delta to WM_MOUSEWHEEL zDelta units.
+# Standard scroll notch = 120 units.  Using a smaller value (e.g. 40) means
+# ~3 pinch frames to equal one notch — smooth zoom without discrete jumps.
+# Increase if zoom feels too slow; decrease if too fast or jumpy.
+ORTHO_ZOOM_SCROLL_SCALE = 40
 
 
 def _rodrigues(v, k, theta):
@@ -598,18 +602,30 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
         changed = True
 
     # --- Zoom ---
-    # Both perspective AND orthographic modes: dolly the eye along the view axis.
-    # Inventor's orthographic camera scales with eye-target distance (unlike
-    # standard OpenGL ortho), so dolly does produce visible zoom in ortho mode.
-    # cam.ViewScale and app.ActiveView.Scale are not available via the dispatch
-    # interface on this Inventor build (confirmed by the probe log above).
+    # Perspective: dolly the eye (works because perspective frustum scales with
+    # eye-target distance).
+    # Orthographic: cam.ViewScale and ActiveView.Scale are not exposed by this
+    # Inventor build's COM dispatch.  Inject WM_MOUSEWHEEL directly to the
+    # viewport window instead — PostMessage bypasses our scroll-suppression hook
+    # and uses Inventor's own zoom handler, which works in both view modes.
+    # Sub-120 zDelta values give smooth, continuous zoom (no discrete notch jumps).
+    _ortho_zoom = 0.0
     if zoom:
-        dolly   = fwd * (zoom * r * ZOOM_SENSITIVITY)
-        new_eye = eye + dolly
-        new_r   = np.linalg.norm(new_eye - target)
-        if new_r > 1e-4:
-            eye     = new_eye
-            changed = True
+        try:
+            is_perspective = cam.Perspective
+        except Exception:
+            is_perspective = True   # safer default: try dolly first
+
+        if is_perspective:
+            dolly   = fwd * (zoom * r * ZOOM_SENSITIVITY)
+            new_eye = eye + dolly
+            new_r   = np.linalg.norm(new_eye - target)
+            if new_r > 1e-4:
+                eye     = new_eye
+                changed = True
+        else:
+            # Ortho: accumulate for scroll injection after cam write.
+            _ortho_zoom = zoom
 
     # --- Roll (two-finger twist → rotate around the camera's forward/view axis) ---
     # Spinning two fingers around the pad centre maps naturally to rolling the
@@ -633,6 +649,11 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
     cam.Eye      = tg.CreatePoint(float(eye[0]),    float(eye[1]),    float(eye[2]))
     cam.Target   = tg.CreatePoint(float(target[0]), float(target[1]), float(target[2]))
     _apply_cam(cam)
+
+    # Ortho zoom: inject scroll AFTER the cam write so the camera position
+    # is stable before Inventor processes the wheel event.
+    if _ortho_zoom:
+        _inject_wheel_zoom(_ortho_zoom)
 
     if not _apply_logged:
         log.info("First gesture applied to Inventor.")
@@ -703,8 +724,39 @@ def apply_orbit(app, dx, dy):
 # TrackPoint camera commands  (share _cs with the touchpad functions above)
 # ---------------------------------------------------------------------------
 
-def apply_tp_orbit(app, dx: float, dy: float) -> None:
-    """Orbit from a TrackPoint move delta, sharing the camera state with touchpad."""
+def _inject_wheel_zoom(zoom: float) -> None:
+    """
+    Post a WM_MOUSEWHEEL message directly to the window under the cursor.
+    PostMessage bypasses the WH_MOUSE_LL hook so our own scroll suppression
+    does not eat the event.  Uses a sub-120 zDelta for smooth, continuous
+    zoom instead of discrete notch steps.
+      zoom > 0  (fingers spread)  → positive zDelta → Inventor zooms IN
+      zoom < 0  (fingers pinch)   → negative zDelta → Inventor zooms OUT
+    """
+    try:
+        pt = ctypes.wintypes.POINT()
+        _u32.GetCursorPos(ctypes.byref(pt))
+        hwnd = _u32.WindowFromPoint(pt)
+        if not hwnd:
+            return
+
+        z = int(zoom * ORTHO_ZOOM_SCROLL_SCALE)
+        if z == 0:
+            return
+
+        # WPARAM high-word = signed zDelta; low-word = virtual-key state (0)
+        z16     = ctypes.c_int16(max(-32768, min(32767, z))).value
+        wparam  = ctypes.c_uint32((z16 & 0xFFFF) << 16).value
+
+        # LPARAM = screen coordinates (x in low word, y in high word)
+        lparam  = ctypes.c_int32(((pt.y & 0xFFFF) << 16) | (pt.x & 0xFFFF)).value
+
+        _u32.PostMessageW(hwnd, WM_MOUSEWHEEL, wparam, lparam)
+    except Exception as e:
+        log.debug("_inject_wheel_zoom: %s", e)
+
+
+def apply_tp_orbit(app, dx: float, dy: float) -> None:    """Orbit from a TrackPoint move delta, sharing the camera state with touchpad."""
     result = _active_view(app)
     if result is None:
         return
@@ -1095,29 +1147,29 @@ def main():
         n = len(fingers)
         now_t = time.monotonic()
 
-        # Desk Mode (_3d_mode_active set): suppress ALL touchpad cursor/scroll
-        # events regardless of what app is in front — trackpad is dead outside
-        # Inventor, and is a 3D mouse inside it.
-        # Couch/Kid Mode (_3d_mode_active clear): never suppress anything;
-        # touchpad behaves as a normal mouse everywhere.
-        in_3d_mode = _3d_mode_active.is_set()
+        # Suppress cursor/scroll only when BOTH conditions are true:
+        #   1. AHK is in Desk Mode (_3d_mode_active set) — or standalone (default)
+        #   2. Inventor is the foreground window
+        # Outside Inventor in Desk Mode, the touchpad behaves as a normal mouse.
+        # In Couch/Kid Mode (_3d_mode_active clear), never suppress anything.
+        active_3d = _3d_mode_active.is_set() and _inventor_is_foreground()
 
         was_active = _single_finger_active.is_set() or _two_fingers_active.is_set()
 
-        if n >= 2 and in_3d_mode:
+        if n >= 2 and active_3d:
             _two_fingers_active.set()
             _single_finger_active.clear()
             _last_touch_t[0] = now_t
             if not was_active:
                 _cs["valid"] = False
-        elif n == 1 and in_3d_mode:
+        elif n == 1 and active_3d:
             _single_finger_active.set()
             _two_fingers_active.clear()
             _last_touch_t[0] = now_t
             if not was_active:
                 _cs["valid"] = False
         else:
-            # Couch/Kid Mode or no fingers — never suppress.
+            # Couch/Kid Mode, Inventor not in front, or no fingers — pass through.
             _single_finger_active.clear()
             _two_fingers_active.clear()
 

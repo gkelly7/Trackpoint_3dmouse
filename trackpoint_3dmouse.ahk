@@ -90,6 +90,7 @@ global isKidMode        := false
 global isTouchScreenOn  := false
 ; --- UDP socket globals ---
 global gUdpSocket  := 0
+global gTrackpadKilled := false   ; Ctrl+Alt+M kill-switch state
 global gSockAddr   := 0
 global gPythonPID  := 0
 
@@ -443,5 +444,23 @@ ExitKidMode(hook, *) {
     ToggleTouchscreen(isTouchScreenOn)
 
     ToolTip("Kid Mode Deactivated")
+    SetTimer(() => ToolTip(), -2000)
+}
+
+; ---------------------------------------------------------------------------
+; Ctrl+Alt+M  --  kill-switch toggle for the trackpad
+; Press once to disable the touchpad (blocks cursor movement and taps).
+; Press again to re-enable it.  Works in any mode.
+; ---------------------------------------------------------------------------
+^!m:: {
+    global gTrackpadKilled
+    gTrackpadKilled := !gTrackpadKilled
+    if (gTrackpadKilled) {
+        ToggleTrackpad(false)
+        ToolTip("Trackpad: KILLED  (Ctrl+Alt+M to restore)")
+    } else {
+        ToggleTrackpad(true)
+        ToolTip("Trackpad: ON")
+    }
     SetTimer(() => ToolTip(), -2000)
 }
