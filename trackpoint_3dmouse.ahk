@@ -253,7 +253,8 @@ ToggleTrackpad(state) {
         RegWrite(state ? 1 : 0, "REG_DWORD", regPath, "Enabled")
         SendMessage(0x1A, 0, StrPtr("PrecisionTouchPad"), , "ahk_id 0xFFFF")
     }
-}
+}
+
 ; Send a 2-byte mode packet to trackpad_gestures.py so it knows
 ; whether to apply 3D gestures (Desk Mode) or be a normal mouse (Couch/Kid).
 ; Packet format: [0xFF, enable_byte]  where enable_byte 1=3D, 0=normal.

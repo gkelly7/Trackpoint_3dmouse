@@ -167,6 +167,8 @@ _cs = {
 # Increase if zoom feels too slow; decrease if too fast or jumpy.
 ORTHO_ZOOM_SCROLL_SCALE = 40
 
+RESYNC_IDLE = 0.5  # re-read camera from Inventor after this many seconds idle
+
 
 def _rodrigues(v, k, theta):
     c, s = math.cos(theta), math.sin(theta)
@@ -756,7 +758,8 @@ def _inject_wheel_zoom(zoom: float) -> None:
         log.debug("_inject_wheel_zoom: %s", e)
 
 
-def apply_tp_orbit(app, dx: float, dy: float) -> None:    """Orbit from a TrackPoint move delta, sharing the camera state with touchpad."""
+def apply_tp_orbit(app, dx: float, dy: float) -> None:
+    """Orbit from a TrackPoint move delta, sharing the camera state with touchpad."""
     result = _active_view(app)
     if result is None:
         return
