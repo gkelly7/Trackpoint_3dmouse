@@ -113,13 +113,18 @@ NumPut("UShort", 2,                                                             
 NumPut("UShort", DllCall("ws2_32\htons",    "UShort", 9999,      "UShort"),               gSockAddr, 2)  ; sin_port
 NumPut("UInt",   DllCall("ws2_32\inet_addr","AStr",   "127.0.0.1","UInt"),                gSockAddr, 4)  ; sin_addr
 
-; Launch the Python camera server (pythonw = no console window)
-_pyScript := A_ScriptDir "\inventor_camera_server.py"
+; Launch the combined Python script.
+; trackpad_gestures.py handles BOTH the TrackPoint UDP input (port 9999)
+; AND Windows Precision Touchpad HID gestures in one process.
+; NOTE: if WPT gestures stop working in Desk Mode, ToggleTrackpad(false)
+; may be blocking raw HID -- remove it from ApplyMode() and rely on the
+; script's WH_MOUSE_LL hook for cursor/scroll suppression instead.
+_pyScript := A_ScriptDir "\trackpad_gestures.py"
 if FileExist(_pyScript) {
     Run('pyw.exe "' _pyScript '"', A_ScriptDir, "Hide", &gPythonPID)
 } else {
     MsgBox(
-        "inventor_camera_server.py not found.`n" .
+        "trackpad_gestures.py not found.`n" .
         "Place it in the same folder as this AHK script:`n" .
         A_ScriptDir,
         "3D Mouse: missing file", "Icon!"

@@ -33,6 +33,7 @@ import ctypes.wintypes
 import logging
 import math
 import os
+import socket
 import struct
 import sys
 import threading
@@ -120,6 +121,28 @@ LIFTOFF_DEBOUNCE = 0.08
 LIFTOFF_WATCHDOG = 0.12
 
 # ---------------------------------------------------------------------------
+# TrackPoint / UDP configuration  (mirrors inventor_camera_server.py)
+# ---------------------------------------------------------------------------
+# UDP socket the AHK script sends TrackPoint packets to.
+TP_UDP_HOST = "127.0.0.1"
+TP_UDP_PORT = 9999
+
+# Radians per TrackPoint delta unit for orbit.
+TP_ORBIT_SENSITIVITY = 0.02
+
+# Fraction of eye-target distance per delta unit for 3D-view pan.
+TP_PAN_SENSITIVITY = 0.001
+
+# Flat units per delta unit for Drawing-document pan.
+TP_DRAWING_PAN_SENSITIVITY = 0.5
+
+# Input smoothing (EMA).  0 = raw, 0.5 = default, 0.7 = heavy/velvety.
+TP_INPUT_SMOOTH = 0.5
+
+# Inertia decay when TrackPoint stops.  0 = instant stop, 0.2 = light coast.
+TP_ORBIT_INERTIA = 0.2
+
+# ---------------------------------------------------------------------------
 # Inventor document type constants
 # ---------------------------------------------------------------------------
 kPartDocumentObject     = 12290
@@ -139,6 +162,9 @@ _cs = {
 }
 
 RESYNC_IDLE = 0.5  # re-read camera from Inventor after this many seconds idle
+
+# One-time ortho zoom diagnostic — set to False to re-run on next pinch.
+_zoom_probe_done = False
 
 
 def _rodrigues(v, k, theta):
@@ -212,6 +238,12 @@ _two_fingers_active = threading.Event()
 # The mouse hook suppresses WM_MOUSEMOVE so the touchpad doesn't move the
 # system cursor while the user is orbiting the model.
 _single_finger_active = threading.Event()
+
+# ---------------------------------------------------------------------------
+# TrackPoint UDP input buffer  (filled by background thread, drained on main)
+# ---------------------------------------------------------------------------
+_tp_buf  = collections.deque(maxlen=120)  # (x, y, mode) 3-tuples
+_tp_lock = threading.Lock()
 
 # RAWINPUTDEVICE
 class RAWINPUTDEVICE(ctypes.Structure):
@@ -582,6 +614,24 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
                 changed = True
         else:
             factor = 1.0 - zoom * ZOOM_SENSITIVITY
+            # --- One-time diagnostic probe ---
+            global _zoom_probe_done
+            if not _zoom_probe_done:
+                _zoom_probe_done = True
+                log.info("=== ORTHO ZOOM PROBE (zoom_delta=%.6f) ===", zoom)
+                log.info("cam.Perspective = %s", is_perspective)
+                try:
+                    _vs = cam.ViewScale
+                    log.info("cam.ViewScale    = %.6f  [ACCESSIBLE]", _vs)
+                except Exception as _e:
+                    log.info("cam.ViewScale    INACCESSIBLE: %s", _e)
+                try:
+                    _avs = app.ActiveView.Scale
+                    log.info("ActiveView.Scale = %.6f  [ACCESSIBLE]", _avs)
+                except Exception as _e:
+                    log.info("ActiveView.Scale INACCESSIBLE: %s", _e)
+                log.info("==========================================")
+            # --- Try cam.ViewScale first (Camera-object property, applied with Apply()) ---
             try:
                 vs = cam.ViewScale
                 new_vs = vs * max(factor, 0.01)
@@ -693,6 +743,93 @@ def apply_orbit(app, dx, dy):
     _apply_cam(cam)
 
     _u32.SetCursorPos(saved_pt.x, saved_pt.y)
+
+
+# ---------------------------------------------------------------------------
+# TrackPoint camera commands  (share _cs with the touchpad functions above)
+# ---------------------------------------------------------------------------
+
+def apply_tp_orbit(app, dx: float, dy: float) -> None:
+    """Orbit from a TrackPoint move delta, sharing the camera state with touchpad."""
+    result = _active_view(app)
+    if result is None:
+        return
+    cam, tg = result
+
+    now = time.monotonic()
+    if not _cs["valid"] or (now - _cs["last_t"]) > RESYNC_IDLE:
+        if not _read_cam(cam):
+            return
+
+    offset = _cs["eye"] - _cs["target"]
+    up     = _cs["up"].copy()
+
+    # Horizontal: turntable around current up vector.
+    if dx:
+        h_angle = -dx * TP_ORBIT_SENSITIVITY
+        offset  = _rodrigues(offset, up, h_angle)
+
+    # Vertical: tilt around camera-right vector.
+    if dy:
+        fwd   = -offset / np.linalg.norm(offset)
+        right = np.cross(fwd, up)
+        rlen  = np.linalg.norm(right)
+        if rlen < 1e-9:
+            right = np.cross(fwd, np.array([1., 0., 0.]))
+            rlen  = np.linalg.norm(right)
+        if rlen > 1e-9:
+            right  /= rlen
+            v_angle = -dy * TP_ORBIT_SENSITIVITY
+            offset  = _rodrigues(offset, right, v_angle)
+            up      = _rodrigues(up,     right, v_angle)
+            up     /= np.linalg.norm(up)
+
+    new_eye = _cs["target"] + offset
+    _cs.update(eye=new_eye, up=up, last_t=now, valid=True)
+
+    cam.UpVector = tg.CreateUnitVector(float(up[0]),      float(up[1]),      float(up[2]))
+    cam.Eye      = tg.CreatePoint(     float(new_eye[0]), float(new_eye[1]), float(new_eye[2]))
+    _apply_cam(cam)
+
+
+def apply_tp_pan(app, dx: float, dy: float) -> None:
+    """Pan from a TrackPoint move delta, sharing the camera state with touchpad."""
+    result = _active_view(app)
+    if result is None:
+        return
+    cam, tg = result
+
+    now = time.monotonic()
+    if not _cs["valid"] or (now - _cs["last_t"]) > RESYNC_IDLE:
+        if not _read_cam(cam):
+            return
+
+    eye    = _cs["eye"]
+    target = _cs["target"]
+    up     = _cs["up"]
+
+    fwd   = (target - eye) / np.linalg.norm(target - eye)
+    right = np.cross(fwd, up)
+    rlen  = np.linalg.norm(right)
+    if rlen < 1e-9:
+        return
+    right /= rlen
+
+    scale = _cs["r"] * TP_PAN_SENSITIVITY
+    try:
+        if app.ActiveDocument.DocumentType == kDrawingDocumentObject:
+            scale = TP_DRAWING_PAN_SENSITIVITY
+    except Exception:
+        pass
+
+    delta      = right * (-dx * scale) + up * (dy * scale)
+    new_eye    = eye    + delta
+    new_target = target + delta
+    _cs.update(eye=new_eye, target=new_target, last_t=now, valid=True)
+
+    cam.Eye    = tg.CreatePoint(float(new_eye[0]),    float(new_eye[1]),    float(new_eye[2]))
+    cam.Target = tg.CreatePoint(float(new_target[0]), float(new_target[1]), float(new_target[2]))
+    _apply_cam(cam)
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +1038,44 @@ def get_inventor():
 
 
 # ---------------------------------------------------------------------------
+# TrackPoint UDP listener  (background thread)
+# ---------------------------------------------------------------------------
+def _start_tp_udp_listener() -> threading.Thread:
+    """
+    Listens for 9-byte TrackPoint packets from the AHK script on UDP 9999.
+    Appends (x, y, mode) tuples to _tp_buf for consumption by the main loop.
+    """
+    def _run():
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((TP_UDP_HOST, TP_UDP_PORT))
+            sock.settimeout(0.5)
+            log.info("TrackPoint UDP listener on %s:%d", TP_UDP_HOST, TP_UDP_PORT)
+            while True:
+                try:
+                    data, _ = sock.recvfrom(64)
+                    if len(data) >= 9:
+                        x, y = struct.unpack_from("<ii", data, 0)
+                        mode = struct.unpack_from("<B",  data, 8)[0]
+                        with _tp_lock:
+                            _tp_buf.append((x, y, mode))
+                except socket.timeout:
+                    pass
+        except Exception as e:
+            log.warning("TrackPoint UDP listener stopped: %s", e)
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_run, daemon=True, name="TrackPointUDP")
+    t.start()
+    return t
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -922,8 +1097,10 @@ def main():
                  "If Inventor is elevated, start this script from an admin prompt.")
 
     log.info("Trackpad gesture controller starting.")
-    log.info("Pan sensitivity: %.6f  Zoom: %.6f  Twist: %.4f",
+    log.info("Touchpad — Pan: %.2f  Zoom: %.2f  Twist: %.2f",
              PAN_SENSITIVITY, ZOOM_SENSITIVITY, TWIST_SENSITIVITY)
+    log.info("TrackPoint — Orbit: %.4f  Pan: %.4f",
+             TP_ORBIT_SENSITIVITY, TP_PAN_SENSITIVITY)
     if args.debug_hid:
         log.info("--debug-hid mode: raw HID bytes will be printed.")
     log.info("Use Ctrl-C to stop.")
@@ -932,6 +1109,14 @@ def main():
     app     = None
     last_reconnect = 0.0
     RECONNECT_INTERVAL = 2.0
+
+    # Start TrackPoint UDP listener (background thread).
+    _start_tp_udp_listener()
+
+    # TrackPoint velocity state (EMA smoothing + inertia).
+    tp_vel_ox = tp_vel_oy = 0.0
+    tp_vel_px = tp_vel_py = 0.0
+    TP_STOP = 0.25
 
     # Capped ring-buffer: holds at most 5 frames.
     # If Inventor is slow, old frames are silently dropped so there is never
@@ -1034,6 +1219,53 @@ def main():
                             apply_gesture(app, pan_x_t, pan_z_t, zoom_t, twist_t)
                         except Exception as e:
                             log.warning("apply_gesture failed: %s", e)
+
+            # --- TrackPoint (UDP) ---
+            # The AHK script only sends packets when Inventor is active, so no
+            # additional foreground check is needed here.
+            with _tp_lock:
+                tp_batch = list(_tp_buf)
+                _tp_buf.clear()
+
+            if tp_batch and app is not None:
+                raw_ox = raw_oy = raw_px = raw_py = 0
+                for x, y, mode in tp_batch:
+                    if mode == 0:
+                        raw_ox += x;  raw_oy += y
+                    else:
+                        raw_px += x;  raw_py += y
+
+                # Cap runaway deltas (same as inventor_camera_server.py)
+                MAX_D = 30
+                raw_ox = max(-MAX_D, min(MAX_D, raw_ox))
+                raw_oy = max(-MAX_D, min(MAX_D, raw_oy))
+                raw_px = max(-MAX_D, min(MAX_D, raw_px))
+                raw_py = max(-MAX_D, min(MAX_D, raw_py))
+
+                # EMA smoothing + inertia (identical to inventor_camera_server.py)
+                if raw_ox or raw_oy:
+                    tp_vel_ox = tp_vel_ox * TP_INPUT_SMOOTH + float(raw_ox) * (1.0 - TP_INPUT_SMOOTH)
+                    tp_vel_oy = tp_vel_oy * TP_INPUT_SMOOTH + float(raw_oy) * (1.0 - TP_INPUT_SMOOTH)
+                else:
+                    tp_vel_ox *= TP_ORBIT_INERTIA;  tp_vel_oy *= TP_ORBIT_INERTIA
+                    if abs(tp_vel_ox) < TP_STOP: tp_vel_ox = 0.0
+                    if abs(tp_vel_oy) < TP_STOP: tp_vel_oy = 0.0
+
+                if raw_px or raw_py:
+                    tp_vel_px = tp_vel_px * TP_INPUT_SMOOTH + float(raw_px) * (1.0 - TP_INPUT_SMOOTH)
+                    tp_vel_py = tp_vel_py * TP_INPUT_SMOOTH + float(raw_py) * (1.0 - TP_INPUT_SMOOTH)
+                else:
+                    tp_vel_px *= TP_ORBIT_INERTIA;  tp_vel_py *= TP_ORBIT_INERTIA
+                    if abs(tp_vel_px) < TP_STOP: tp_vel_px = 0.0
+                    if abs(tp_vel_py) < TP_STOP: tp_vel_py = 0.0
+
+                try:
+                    if tp_vel_ox or tp_vel_oy:
+                        apply_tp_orbit(app, tp_vel_ox, tp_vel_oy)
+                    if tp_vel_px or tp_vel_py:
+                        apply_tp_pan(app, tp_vel_px, tp_vel_py)
+                except Exception as e:
+                    log.warning("TrackPoint apply failed: %s", e)
 
             # Heartbeat
             if now - _heartbeat >= 10.0:
