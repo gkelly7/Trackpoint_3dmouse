@@ -242,6 +242,14 @@ _single_finger_active = threading.Event()
 _tp_buf  = collections.deque(maxlen=120)  # (x, y, mode) 3-tuples
 _tp_lock = threading.Lock()
 
+# 3D gesture mode flag.
+# True  = Desk Mode: apply 3D gestures to Inventor (set by AHK mode packet
+#         OR by default when running standalone without AHK).
+# False = Couch/Kid Mode: touchpad is a normal mouse; never suppress events.
+# The AHK sends a 2-byte packet [0xFF, 0x01/0x00] via UDP when switching modes.
+_3d_mode_active = threading.Event()
+_3d_mode_active.set()   # default: assume 3D mode (standalone / Desk Mode)
+
 # RAWINPUTDEVICE
 class RAWINPUTDEVICE(ctypes.Structure):
     _fields_ = [
@@ -1001,7 +1009,18 @@ def _start_tp_udp_listener() -> threading.Thread:
             while True:
                 try:
                     data, _ = sock.recvfrom(64)
-                    if len(data) >= 9:
+                    if len(data) == 2 and data[0] == 0xFF:
+                        # Mode-control packet from AHK: [0xFF, enable_byte]
+                        if data[1]:
+                            _3d_mode_active.set()
+                            log.info("AHK: Desk Mode — 3D gestures ENABLED")
+                        else:
+                            _3d_mode_active.clear()
+                            # Release any held suppression immediately
+                            _single_finger_active.clear()
+                            _two_fingers_active.clear()
+                            log.info("AHK: Couch/Kid Mode — 3D gestures DISABLED")
+                    elif len(data) >= 9:
                         x, y = struct.unpack_from("<ii", data, 0)
                         mode = struct.unpack_from("<B",  data, 8)[0]
                         with _tp_lock:
@@ -1076,29 +1095,28 @@ def main():
         n = len(fingers)
         now_t = time.monotonic()
 
-        # Only activate cursor/scroll suppression when Inventor is in the
-        # foreground.  In Couch Mode (Inventor not active) the touchpad must
-        # behave completely normally — cursor movement and scroll pass through.
-        inv_fg = _inventor_is_foreground()
+        # Suppress cursor/scroll only when BOTH conditions are true:
+        #   1. AHK is in Desk Mode (_3d_mode_active) — or standalone (default True)
+        #   2. Inventor is the foreground window
+        # In Couch/Kid Mode the touchpad must behave completely normally.
+        active_3d = _3d_mode_active.is_set() and _inventor_is_foreground()
 
         was_active = _single_finger_active.is_set() or _two_fingers_active.is_set()
 
-        if n >= 2 and inv_fg:
+        if n >= 2 and active_3d:
             _two_fingers_active.set()
             _single_finger_active.clear()
             _last_touch_t[0] = now_t
-            # Invalidate camera cache on gesture start so we always re-read
-            # from Inventor rather than replaying a stale position.
             if not was_active:
                 _cs["valid"] = False
-        elif n == 1 and inv_fg:
+        elif n == 1 and active_3d:
             _single_finger_active.set()
             _two_fingers_active.clear()
             _last_touch_t[0] = now_t
             if not was_active:
                 _cs["valid"] = False
         else:
-            # Either no fingers or Inventor not in front — never suppress.
+            # Couch/Kid Mode OR Inventor not in front — pass all events through.
             _single_finger_active.clear()
             _two_fingers_active.clear()
 
@@ -1133,13 +1151,15 @@ def main():
                 _finger_buf.clear()
 
             if batch and app is not None:
-                # Skip gesture processing when Inventor is not in the foreground.
-                if not _inventor_is_foreground():
+                # Skip gesture processing when in Couch/Kid Mode or Inventor
+                # is not the foreground window.
+                if not _3d_mode_active.is_set() or not _inventor_is_foreground():
                     if log.isEnabledFor(logging.DEBUG):
                         hwnd = _u32.GetForegroundWindow()
                         buf  = ctypes.create_unicode_buffer(256)
                         _u32.GetWindowTextW(hwnd, buf, 256)
-                        log.debug("gesture skipped: foreground='%s'", buf.value)
+                        log.debug("gesture skipped: 3d_mode=%s foreground='%s'",
+                                  _3d_mode_active.is_set(), buf.value)
                     gesture.reset()
                 else:
                     pan_x_t = pan_z_t = zoom_t = twist_t = 0.0
