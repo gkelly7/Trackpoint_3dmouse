@@ -163,9 +163,6 @@ _cs = {
 
 RESYNC_IDLE = 0.5  # re-read camera from Inventor after this many seconds idle
 
-# One-time ortho zoom diagnostic — set to False to re-run on next pinch.
-_zoom_probe_done = False
-
 
 def _rodrigues(v, k, theta):
     c, s = math.cos(theta), math.sin(theta)
@@ -593,61 +590,18 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
         changed = True
 
     # --- Zoom ---
-    # Perspective mode: dolly the eye along the view axis.
-    # Orthographic mode: adjust cam.ViewScale (the Camera object's own scale
-    #   property) BEFORE calling Apply() so it is committed in one shot.
-    #   Fallback: app.ActiveView.Scale post-apply (DrawingView-style API,
-    #   less reliable for 3D views but kept as a safety net).
-    _pending_vs = None
+    # Both perspective AND orthographic modes: dolly the eye along the view axis.
+    # Inventor's orthographic camera scales with eye-target distance (unlike
+    # standard OpenGL ortho), so dolly does produce visible zoom in ortho mode.
+    # cam.ViewScale and app.ActiveView.Scale are not available via the dispatch
+    # interface on this Inventor build (confirmed by the probe log above).
     if zoom:
-        try:
-            is_perspective = cam.Perspective
-        except Exception:
-            is_perspective = False   # assume ortho if property not readable
-
-        if is_perspective:
-            dolly   = fwd * (zoom * r * ZOOM_SENSITIVITY)
-            new_eye = eye + dolly
-            new_r   = np.linalg.norm(new_eye - target)
-            if new_r > 1e-4:
-                eye     = new_eye
-                changed = True
-        else:
-            factor = 1.0 - zoom * ZOOM_SENSITIVITY
-            # --- One-time diagnostic probe ---
-            global _zoom_probe_done
-            if not _zoom_probe_done:
-                _zoom_probe_done = True
-                log.info("=== ORTHO ZOOM PROBE (zoom_delta=%.6f) ===", zoom)
-                log.info("cam.Perspective = %s", is_perspective)
-                try:
-                    _vs = cam.ViewScale
-                    log.info("cam.ViewScale    = %.6f  [ACCESSIBLE]", _vs)
-                except Exception as _e:
-                    log.info("cam.ViewScale    INACCESSIBLE: %s", _e)
-                try:
-                    _avs = app.ActiveView.Scale
-                    log.info("ActiveView.Scale = %.6f  [ACCESSIBLE]", _avs)
-                except Exception as _e:
-                    log.info("ActiveView.Scale INACCESSIBLE: %s", _e)
-                log.info("==========================================")
-            # --- Try cam.ViewScale first (Camera-object property, applied with Apply()) ---
-            try:
-                vs = cam.ViewScale
-                new_vs = vs * max(factor, 0.01)
-                cam.ViewScale = new_vs
-                changed = True
-                log.debug("ortho zoom: cam.ViewScale %.4f → %.4f", vs, new_vs)
-            except Exception as e1:
-                # cam.ViewScale not available on this Inventor build — try View.Scale
-                log.debug("cam.ViewScale unavailable (%s), trying ActiveView.Scale", e1)
-                try:
-                    vs = app.ActiveView.Scale
-                    _pending_vs = vs * max(factor, 0.01)
-                    changed = True
-                    log.debug("ortho zoom: ActiveView.Scale %.4f → %.4f", vs, _pending_vs)
-                except Exception as e2:
-                    log.debug("ortho zoom failed entirely: %s", e2)
+        dolly   = fwd * (zoom * r * ZOOM_SENSITIVITY)
+        new_eye = eye + dolly
+        new_r   = np.linalg.norm(new_eye - target)
+        if new_r > 1e-4:
+            eye     = new_eye
+            changed = True
 
     # --- Roll (two-finger twist → rotate around the camera's forward/view axis) ---
     # Spinning two fingers around the pad centre maps naturally to rolling the
@@ -663,9 +617,7 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
     if not changed:
         return
 
-    # Write back — Eye/Target/UpVector first, ViewScale last.
-    # Setting Eye/Target can reset ViewScale internally in Inventor, so ortho
-    # zoom must be applied after the positional properties.
+    # Write back.
     r_new = np.linalg.norm(eye - target)
     _cs.update(eye=eye, target=target, up=up, r=r_new, last_t=now, valid=True)
 
@@ -673,12 +625,6 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
     cam.Eye      = tg.CreatePoint(float(eye[0]),    float(eye[1]),    float(eye[2]))
     cam.Target   = tg.CreatePoint(float(target[0]), float(target[1]), float(target[2]))
     _apply_cam(cam)
-    # Ortho zoom: app.ActiveView.Scale must be set AFTER cam.Apply()
-    if _pending_vs is not None:
-        try:
-            app.ActiveView.Scale = _pending_vs
-        except Exception as e:
-            log.debug("ortho zoom apply failed: %s", e)
 
     if not _apply_logged:
         log.info("First gesture applied to Inventor.")
@@ -1130,25 +1076,32 @@ def main():
         n = len(fingers)
         now_t = time.monotonic()
 
-        # Detect gesture start (transition from idle → active).
-        # Invalidate the camera cache so the first apply_orbit / apply_gesture
-        # always re-reads the current camera from Inventor instead of replaying
-        # a stale position that could jump the model.
-        was_active = _single_finger_active.is_set() or _two_fingers_active.is_set()
-        if n > 0 and not was_active:
-            _cs["valid"] = False
+        # Only activate cursor/scroll suppression when Inventor is in the
+        # foreground.  In Couch Mode (Inventor not active) the touchpad must
+        # behave completely normally — cursor movement and scroll pass through.
+        inv_fg = _inventor_is_foreground()
 
-        if n >= 2:
+        was_active = _single_finger_active.is_set() or _two_fingers_active.is_set()
+
+        if n >= 2 and inv_fg:
             _two_fingers_active.set()
             _single_finger_active.clear()
             _last_touch_t[0] = now_t
-        elif n == 1:
+            # Invalidate camera cache on gesture start so we always re-read
+            # from Inventor rather than replaying a stale position.
+            if not was_active:
+                _cs["valid"] = False
+        elif n == 1 and inv_fg:
             _single_finger_active.set()
             _two_fingers_active.clear()
             _last_touch_t[0] = now_t
+            if not was_active:
+                _cs["valid"] = False
         else:
+            # Either no fingers or Inventor not in front — never suppress.
             _single_finger_active.clear()
             _two_fingers_active.clear()
+
         with _finger_lock:
             _finger_buf.append(fingers)
 
