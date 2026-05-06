@@ -634,7 +634,9 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
     # Ortho zoom fires regardless of whether pan/twist also changed —
     # move it before the `if not changed` guard so it is never skipped.
     if _ortho_zoom:
-        _inject_wheel_zoom(app, _ortho_zoom)
+        _inject_wheel_zoom(app, -_ortho_zoom)   # negate: Inventor scroll-zoom is inverted
+        _cs["valid"] = False   # Inventor's view changed via WM_MOUSEWHEEL; force
+                               # re-read on next apply so cam writes don't undo the zoom
 
     # --- Roll (two-finger twist → rotate around the camera's forward/view axis) ---
     # Spinning two fingers around the pad centre maps naturally to rolling the
