@@ -5,26 +5,31 @@ User wants to use the ThinkPad TrackPoint as a cursor-independent 3D mouse
 while working in Autodesk Inventor 2024, without relying on cursor movement.
 Orbit on bare TrackPoint movement; pan with center button held; zoom via scroll wheel.
 
-## Architecture
-- **trackpoint_3dmouse.ahk** — AHK v2 script (builds on user's existing script).
-  Uses AutoHotInterception to intercept raw TrackPoint input by device VID/PID.
-  In Desk Mode + Inventor active: sends x,y deltas via UDP (9 bytes, 127.0.0.1:9999)
-  instead of mouse_event. All other apps use the original middle-drag behaviour.
-- **inventor_camera_server.py** — Python UDP server.
-  Connects to Inventor 2024 via win32com COM API (`GetActiveObject`).
-  `do_orbit()`: Rodrigues rotation of Eye around Target (horizontal=WORLD_UP, vertical=camera-right).
-  `do_pan()`: translate Eye+Target together in camera plane.
+## Architecture  (current — single unified script)
+- **trackpad_gestures.py** — Main script. Handles everything:
+  - Raw WPT HID input via `RegisterRawInputDevices` (one-finger orbit, two-finger pan/zoom/twist)
+  - TrackPoint UDP listener on port 9999 (orbit + pan from AHK packets)
+  - Autodesk Inventor COM camera manipulation (`win32com.client.GetActiveObject`)
+  - `WH_MOUSE_LL` hook to suppress cursor movement (1-finger orbit) and scroll events (2-finger gestures) inside Inventor
+  - Mode-switching via 2-byte AHK UDP control packets `[0xFF, 0x01/0x00]`
+- **trackpoint_3dmouse.ahk** — AHK v2 script. Keyboard/TrackPoint hooks, UI overlays, UDP sender. Sends 9-byte move packets and 2-byte mode packets to Python.
+- **inventor_camera_server.py** — OBSOLETE. All logic merged into trackpad_gestures.py.
 
 ## IPC Protocol
-9-byte UDP packet from AHK → Python:
+9-byte UDP move packet (AHK → Python):
   bytes 0-3: x delta  (int32, little-endian)
   bytes 4-7: y delta  (int32, little-endian)
   byte    8: mode     (0=orbit, 1=pan)
 
+2-byte UDP mode packet (AHK → Python):
+  byte 0: 0xFF (sentinel)
+  byte 1: 0x01 = Desk Mode (3D gestures ON), 0x00 = Couch/Kid Mode (gestures OFF)
+
 ## Modes
-- Desk (default): TrackPoint = 3D camera in Inventor / middle-drag elsewhere
-- Couch (center+left): Trackpad on, normal mouse
+- Desk (default): TrackPoint = 3D camera in Inventor / normal mouse elsewhere
+- Couch (center+left toggle): Trackpad acts as normal mouse, 3D gestures disabled
 - Kids (Ctrl+Alt+K): Everything off, only Esc works
+- Ctrl+Alt+M: AHK kill-switch toggles trackpad driver on/off
 
 ## Implemented
 - 2025-01: AHK UDP socket init (WSA), Send3DMove(), modified OnTrackpointMove()
@@ -33,25 +38,23 @@ Orbit on bare TrackPoint movement; pan with center button held; zoom via scroll 
 - 2025-01: Auto-launch Python server from AHK; auto-kill on exit
 - 2025-01: SETUP.md with prerequisites, VID/PID instructions, sensitivity tuning
 - 2026-02: Replaced spherical-coord orbit with camera-relative Rodrigues rotation
-  - Horizontal orbit: rotates around world up (turntable, always left/right relative to view)
-  - Vertical orbit: rotates around camera's current right vector (always tilts relative to view)
-  - Removed hard elevation clamp -- full 360 degrees vertical now possible
-- 2026-02: Fixed pan up/down reversal (dy sign was negated, now positive)
-- 2026-02: _apply_cam() logs which method is used on first call
-- 2026-02: Removed 3D Mouse (SpaceMouse) mode entirely from AHK — only Desk/Couch/Kid modes remain
-- 2026-02: Multi-instance Inventor support in Python server
-  - _get_all_inventor_apps(): enumerates all Inventor instances via Windows ROT
-  - get_inventor(): matches foreground window PID to instance MainFrameHWND
-  - Main loop polls every INSTANCE_POLL_INTERVAL (1s) and auto-switches to focused instance
-  - last_reconnect reset to 0 on instance switch so reconnect is immediate (no 2s delay)
-- 2026-02: Fixed elevation mismatch (root cause of "no response in Inventor")
-  - AHK script was launching pyw.exe elevated (inherited from *RunAs admin)
-  - Elevated Python cannot see non-elevated Inventor in the Windows ROT
-  - Fix: launch pyw.exe via Shell.Application.ShellExecute (always non-elevated)
-  - PID discovery moved to async WMI query via SetTimer (2s after launch)
-  - Added diagnostic logging: CLSID at startup, ROT entries on scan miss, GetActiveObject exception message
-- 2026-02: AppSwitcher AHK helper provided (InventorMainWindows + CycleInventorInstances)
-  - Filters Inventor sub-windows via: no owner + non-empty title + "Inventor" in title
+- 2026-02: Fixed pan up/down reversal
+- 2026-02: Multi-instance Inventor support (ROT enumeration, PID matching)
+- 2026-02: Fixed elevation mismatch (non-elevated Shell.Application.ShellExecute launch)
+- 2026-02: **ARCHITECTURE MERGE** — `inventor_camera_server.py` UDP logic fully merged into
+  `trackpad_gestures.py`. Both WPT touchpad and TrackPoint share a single `_cs` camera state.
+  `inventor_camera_server.py` is now obsolete.
+- 2026-02: Raw WPT HID input (RegisterRawInputDevices) for touchpad gestures
+- 2026-02: 1-finger orbit gesture (WH_MOUSE_LL suppresses cursor during orbit)
+- 2026-02: 2-finger pan / pinch-zoom (perspective) / twist-to-roll gestures
+- 2026-02: WH_MOUSE_LL hook suppresses scroll events during 2-finger gestures
+- 2026-02: LIFTOFF_WATCHDOG timer force-releases suppression flags when WPT stops reporting
+- 2026-02: AHK Ctrl+Alt+M kill-switch to toggle trackpad driver
+- 2026-02: AHK Couch Mode: sends [0xFF, 0x00] UDP packet to disable 3D gestures;
+  Desk Mode: sends [0xFF, 0x01]. Normal mouse behaviour restored in Couch/Kid Mode.
+- 2026-02: Ortho zoom via WM_MOUSEWHEEL injection attempted and reverted —
+  caused flash-back and broke pan/twist in ortho mode. Accepted trade-off:
+  **ortho zoom not supported**; pan and twist work in both perspective and ortho.
 
 ## User Personas
 - Power CAD user with ThinkPad, no dedicated 3D mouse, familiar with AHK+Python
@@ -74,11 +77,11 @@ Maps 2-finger gestures to Inventor camera: pan / pinch-zoom / twist-rotate.
 5. (Stretch) Twist-to-rotate: test if angle noise is acceptable on hardware
 
 ## Backlog / Enhancements
-- P1: Test with actual Inventor 2024 and tune default sensitivities
-- P1: Add separate ORBIT_SENSITIVITY_H / ORBIT_SENSITIVITY_V config
+- P1: Tune default sensitivities (PAN_SENSITIVITY, ZOOM_SENSITIVITY, TWIST_SENSITIVITY, ORBIT_*)
 - P1: Calibrate trackpad X_MAX / Y_MAX on hardware; verify pan/zoom feel
 - P2: Support Presentation documents (kPresentationDocumentObject=12293)
 - P2: Optional momentum/inertia after TrackPoint release
 - P2: Tray notification showing connected/disconnected status
-- P3: Twist-to-rotate (Y-axis orbit) via 2-finger angle — depends on noise level
+- P3: Ortho zoom — currently unsupported (cam.ViewScale inaccessible via COM;
+  WM_MOUSEWHEEL injection caused flash-back; accepted trade-off)
 - P3: 3DConnexion virtual HID emulation (full 6DOF, needs kernel driver)

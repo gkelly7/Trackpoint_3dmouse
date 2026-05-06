@@ -604,20 +604,14 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
         changed = True
 
     # --- Zoom ---
-    # Perspective: dolly the eye (works because perspective frustum scales with
-    # eye-target distance).
-    # Orthographic: cam.ViewScale and ActiveView.Scale are not exposed by this
-    # Inventor build's COM dispatch.  Inject WM_MOUSEWHEEL directly to the
-    # viewport window instead — PostMessage bypasses our scroll-suppression hook
-    # and uses Inventor's own zoom handler, which works in both view modes.
-    # Sub-120 zDelta values give smooth, continuous zoom (no discrete notch jumps).
-    _ortho_zoom = 0.0
+    # Perspective only: dolly the eye along the view axis.
+    # Orthographic: cam.ViewScale is not exposed by this Inventor build's COM
+    # dispatch, so ortho zoom is intentionally not supported here.
     if zoom:
         try:
             is_perspective = cam.Perspective
         except Exception:
-            is_perspective = True   # safer default: try dolly first
-        log.info("zoom check: perspective=%s  zoom_delta=%.4f", is_perspective, zoom)
+            is_perspective = True   # safer default
 
         if is_perspective:
             dolly   = fwd * (zoom * r * ZOOM_SENSITIVITY)
@@ -626,34 +620,9 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
             if new_r > 1e-4:
                 eye     = new_eye
                 changed = True
-        else:
-            # Ortho: accumulate for scroll injection — must fire even when
-            # nothing else changed, so we handle it before the early return.
-            _ortho_zoom = zoom
-
-    # Ortho zoom fires regardless of whether pan/twist also changed.
-    # IMPORTANT: return immediately after injecting so _apply_cam() is never
-    # called in the same batch.  In Inventor, cam.Apply() resets the ortho
-    # view scale to a value derived from eye-target distance — calling it
-    # after a WM_MOUSEWHEEL zoom would undo the zoom every single frame.
-    if _ortho_zoom:
-        _inject_wheel_zoom(app, -_ortho_zoom)
-        _cs["valid"] = False
-        return
+        # Ortho: no zoom action — pan and twist still work normally.
 
     # --- Roll (two-finger twist → rotate around the camera's forward/view axis) ---
-    # Spinning two fingers around the pad centre maps naturally to rolling the
-    # model around the axis that points straight through the lens (fwd).
-    # Eye and target positions stay fixed; only the camera up-vector rotates,
-    # which Inventor interprets as the model spinning on the view axis.
-    if twist_y:
-        angle = twist_y * TWIST_SENSITIVITY
-        up    = _rodrigues(up, fwd, angle)
-        up   /= np.linalg.norm(up)
-        changed = True
-
-    if not changed:
-        return
     # Spinning two fingers around the pad centre maps naturally to rolling the
     # model around the axis that points straight through the lens (fwd).
     # Eye and target positions stay fixed; only the camera up-vector rotates,
