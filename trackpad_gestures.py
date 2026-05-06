@@ -165,7 +165,7 @@ _cs = {
 # Standard scroll notch = 120 units.  Using a smaller value (e.g. 40) means
 # ~3 pinch frames to equal one notch — smooth zoom without discrete jumps.
 # Increase if zoom feels too slow; decrease if too fast or jumpy.
-ORTHO_ZOOM_SCROLL_SCALE = 40
+ORTHO_ZOOM_SCROLL_SCALE = 800   # ~1 notch per pinch frame at typical speed
 
 RESYNC_IDLE = 0.5  # re-read camera from Inventor after this many seconds idle
 
@@ -627,10 +627,28 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
                 eye     = new_eye
                 changed = True
         else:
-            # Ortho: accumulate for scroll injection after cam write.
+            # Ortho: accumulate for scroll injection — must fire even when
+            # nothing else changed, so we handle it before the early return.
             _ortho_zoom = zoom
 
+    # Ortho zoom fires regardless of whether pan/twist also changed —
+    # move it before the `if not changed` guard so it is never skipped.
+    if _ortho_zoom:
+        _inject_wheel_zoom(app, _ortho_zoom)
+
     # --- Roll (two-finger twist → rotate around the camera's forward/view axis) ---
+    # Spinning two fingers around the pad centre maps naturally to rolling the
+    # model around the axis that points straight through the lens (fwd).
+    # Eye and target positions stay fixed; only the camera up-vector rotates,
+    # which Inventor interprets as the model spinning on the view axis.
+    if twist_y:
+        angle = twist_y * TWIST_SENSITIVITY
+        up    = _rodrigues(up, fwd, angle)
+        up   /= np.linalg.norm(up)
+        changed = True
+
+    if not changed:
+        return
     # Spinning two fingers around the pad centre maps naturally to rolling the
     # model around the axis that points straight through the lens (fwd).
     # Eye and target positions stay fixed; only the camera up-vector rotates,
@@ -652,11 +670,6 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
     cam.Eye      = tg.CreatePoint(float(eye[0]),    float(eye[1]),    float(eye[2]))
     cam.Target   = tg.CreatePoint(float(target[0]), float(target[1]), float(target[2]))
     _apply_cam(cam)
-
-    # Ortho zoom: inject scroll AFTER the cam write so the camera position
-    # is stable before Inventor processes the wheel event.
-    if _ortho_zoom:
-        _inject_wheel_zoom(app, _ortho_zoom)
 
     if not _apply_logged:
         log.info("First gesture applied to Inventor.")
