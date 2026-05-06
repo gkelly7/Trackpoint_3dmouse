@@ -617,6 +617,7 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
             is_perspective = cam.Perspective
         except Exception:
             is_perspective = True   # safer default: try dolly first
+        log.info("zoom check: perspective=%s  zoom_delta=%.4f", is_perspective, zoom)
 
         if is_perspective:
             dolly   = fwd * (zoom * r * ZOOM_SENSITIVITY)
