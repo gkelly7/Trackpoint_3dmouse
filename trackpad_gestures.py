@@ -655,7 +655,7 @@ def apply_gesture(app, pan_x, pan_z, zoom, twist_y):
     # Ortho zoom: inject scroll AFTER the cam write so the camera position
     # is stable before Inventor processes the wheel event.
     if _ortho_zoom:
-        _inject_wheel_zoom(_ortho_zoom)
+        _inject_wheel_zoom(app, _ortho_zoom)
 
     if not _apply_logged:
         log.info("First gesture applied to Inventor.")
@@ -726,36 +726,48 @@ def apply_orbit(app, dx, dy):
 # TrackPoint camera commands  (share _cs with the touchpad functions above)
 # ---------------------------------------------------------------------------
 
-def _inject_wheel_zoom(zoom: float) -> None:
+def _inject_wheel_zoom(app, zoom: float) -> None:
     """
-    Post a WM_MOUSEWHEEL message directly to the window under the cursor.
-    PostMessage bypasses the WH_MOUSE_LL hook so our own scroll suppression
-    does not eat the event.  Uses a sub-120 zDelta for smooth, continuous
-    zoom instead of discrete notch steps.
-      zoom > 0  (fingers spread)  → positive zDelta → Inventor zooms IN
-      zoom < 0  (fingers pinch)   → negative zDelta → Inventor zooms OUT
+    Post a WM_MOUSEWHEEL to Inventor's main window for ortho-mode zoom.
+    Uses app.MainFrameHWND so we always target the right window regardless
+    of where the cursor happens to be.  Accumulates sub-threshold deltas
+    and fires in 120-unit increments so Inventor's zoom handler actually
+    triggers — but the firing rate is proportional to pinch speed so zoom
+    feels smooth rather than stepping.
+
+    zoom > 0  (spread)  → positive zDelta → zoom IN
+    zoom < 0  (pinch)   → negative zDelta → zoom OUT
     """
     try:
-        pt = ctypes.wintypes.POINT()
-        _u32.GetCursorPos(ctypes.byref(pt))
-        hwnd = _u32.WindowFromPoint(pt)
+        hwnd = int(app.MainFrameHWND)
         if not hwnd:
             return
 
-        z = int(zoom * ORTHO_ZOOM_SCROLL_SCALE)
-        if z == 0:
+        _inject_wheel_zoom._acc += zoom * ORTHO_ZOOM_SCROLL_SCALE
+
+        # Fire full WHEEL_DELTA (120) increments only — Inventor ignores smaller
+        # values.  The accumulator ensures firing rate tracks gesture speed.
+        WHEEL_DELTA = 120
+        steps = int(_inject_wheel_zoom._acc / WHEEL_DELTA)
+        if steps == 0:
             return
+        _inject_wheel_zoom._acc -= steps * WHEEL_DELTA
 
-        # WPARAM high-word = signed zDelta; low-word = virtual-key state (0)
-        z16     = ctypes.c_int16(max(-32768, min(32767, z))).value
-        wparam  = ctypes.c_uint32((z16 & 0xFFFF) << 16).value
+        z = steps * WHEEL_DELTA
+        z16    = ctypes.c_int16(max(-32768, min(32767, z))).value
+        wparam = ctypes.c_uint32((z16 & 0xFFFF) << 16).value
 
-        # LPARAM = screen coordinates (x in low word, y in high word)
-        lparam  = ctypes.c_int32(((pt.y & 0xFFFF) << 16) | (pt.x & 0xFFFF)).value
+        pt     = ctypes.wintypes.POINT()
+        _u32.GetCursorPos(ctypes.byref(pt))
+        lparam = ctypes.c_int32(((pt.y & 0xFFFF) << 16) | (pt.x & 0xFFFF)).value
 
+        log.debug("ortho wheel zoom: hwnd=0x%X z=%+d acc=%.1f",
+                  hwnd, z, _inject_wheel_zoom._acc)
         _u32.PostMessageW(hwnd, WM_MOUSEWHEEL, wparam, lparam)
     except Exception as e:
         log.debug("_inject_wheel_zoom: %s", e)
+
+_inject_wheel_zoom._acc = 0.0   # per-function accumulator (survives call boundaries)
 
 
 def apply_tp_orbit(app, dx: float, dy: float) -> None:
