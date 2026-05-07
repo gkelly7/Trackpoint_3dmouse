@@ -52,7 +52,11 @@ Orbit on bare TrackPoint movement; pan with center button held; zoom via scroll 
 - 2026-02: AHK Ctrl+Alt+M kill-switch to toggle trackpad driver
 - 2026-02: AHK Couch Mode: sends [0xFF, 0x00] UDP packet to disable 3D gestures;
   Desk Mode: sends [0xFF, 0x01]. Normal mouse behaviour restored in Couch/Kid Mode.
-- 2026-02: Ortho zoom via WM_MOUSEWHEEL injection attempted and reverted —
+- 2026-02: Tap-to-face-view: single-finger tap snaps Inventor camera to ViewCube face
+  - Pad divided into 5 zones: center (Front), top (Top), bottom (Bottom), left (Left), right (Right)
+  - Uses Camera.SetToCubicView(CubeViewTypeEnum) — respects custom ViewCube orientation
+  - Tap = touch < 180 ms + movement < 4 % of pad width; genuine orbits never trigger it
+  - CubeViewTypeEnum constants may need verification against Inventor SDK CHM (see log warnings)
   caused flash-back and broke pan/twist in ortho mode. Accepted trade-off:
   **ortho zoom not supported**; pan and twist work in both perspective and ortho.
 

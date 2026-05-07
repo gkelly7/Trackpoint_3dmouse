@@ -120,6 +120,18 @@ LIFTOFF_DEBOUNCE = 0.08
 # ~10 ms WPT report interval but quick enough to feel instant on release.
 LIFTOFF_WATCHDOG = 0.12
 
+# Tap-to-face-view detection thresholds.
+# A single-finger touch that lifts within TAP_MAX_DURATION seconds and never
+# moved more than TAP_MAX_MOVE normalised units is treated as a "tap", which
+# snaps Inventor to the ViewCube face for that pad zone.
+# Short duration + tiny movement means virtually zero collision with orbit drags.
+TAP_MAX_DURATION = 0.18   # seconds
+TAP_MAX_MOVE     = 0.04   # normalised pad units (~4 % of pad width)
+
+# Fraction of the pad edge that maps to a directional zone (L/R/T/B).
+# 0.25 → outer 25 % of each side is directional; inner 50 % is centre.
+TAP_ZONE_EDGE = 0.25
+
 # ---------------------------------------------------------------------------
 # TrackPoint / UDP configuration  (mirrors inventor_camera_server.py)
 # ---------------------------------------------------------------------------
@@ -148,6 +160,21 @@ TP_ORBIT_INERTIA = 0.2
 kPartDocumentObject     = 12290
 kAssemblyDocumentObject = 12291
 kDrawingDocumentObject  = 12292
+
+# ---------------------------------------------------------------------------
+# Inventor ViewCube face constants  (CubeViewTypeEnum)
+# Passed to Camera.SetToCubicView() — respects any custom ViewCube orientation
+# the user has set via right-click → "Set Current View as Front" etc.
+# NOTE: If a constant triggers a COM exception the log will say so; the
+# correct values can then be read from the Inventor SDK CHM.
+# ---------------------------------------------------------------------------
+kCubeViewIsometric = 65536   # 0x10000
+kCubeViewTop       = 65537   # 0x10001
+kCubeViewBottom    = 65538   # 0x10002
+kCubeViewFront     = 65539   # 0x10003
+kCubeViewBack      = 65540   # 0x10004
+kCubeViewLeft      = 65541   # 0x10005
+kCubeViewRight     = 65542   # 0x10006
 
 # ---------------------------------------------------------------------------
 # Persistent camera state (shared with orbit calls)
@@ -480,17 +507,34 @@ class GestureRecognizer:
         # shared
         self._last_count = 0
         self._last_seen  = 0.0
+        # tap candidate (1-finger only)
+        self._tap_start_t    = None
+        self._tap_start_x    = None
+        self._tap_start_y    = None
+        self._tap_max_disp   = 0.0
 
     def process(self, fingers: list) -> dict | None:
         now   = time.monotonic()
         count = len(fingers)
 
-        # All-lift: debounce briefly then reset
+        # All-lift: debounce briefly then check for tap, then reset.
         if count == 0:
             if now - self._last_seen < LIFTOFF_DEBOUNCE:
                 return None
+            tap = None
+            if (self._last_count == 1
+                    and self._tap_start_t is not None
+                    and (self._last_seen - self._tap_start_t) < TAP_MAX_DURATION
+                    and self._tap_max_disp < TAP_MAX_MOVE):
+                tap = {"type": "tap",
+                       "x":    self._tap_start_x,
+                       "y":    self._tap_start_y}
+                log.debug("tap: zone candidate (%.2f, %.2f)  dur=%.0f ms  disp=%.3f",
+                          self._tap_start_x, self._tap_start_y,
+                          (self._last_seen - self._tap_start_t) * 1000,
+                          self._tap_max_disp)
             self.reset()
-            return None
+            return tap
 
         self._last_seen = now
 
@@ -500,13 +544,21 @@ class GestureRecognizer:
             self._prev_1x = self._prev_cx = None   # invalidate both
             self._last_count = count
 
-        # ---- one finger: orbit ----
+        # ---- one finger: orbit (or tap candidate) ----
         if count == 1:
             cx = fingers[0]["x"]
             cy = fingers[0]["y"]
             if self._prev_1x is None:
                 self._prev_1x, self._prev_1y = cx, cy
+                # Record tap candidate on first contact.
+                self._tap_start_t    = now
+                self._tap_start_x    = cx
+                self._tap_start_y    = cy
+                self._tap_max_disp   = 0.0
                 return None
+            # Keep running max displacement so a genuine orbit cancels tap.
+            disp = math.hypot(cx - self._tap_start_x, cy - self._tap_start_y)
+            self._tap_max_disp = max(self._tap_max_disp, disp)
             dx = cx - self._prev_1x
             dy = cy - self._prev_1y
             self._prev_1x, self._prev_1y = cx, cy
@@ -708,6 +760,48 @@ def apply_orbit(app, dx, dy):
     _apply_cam(cam)
 
     _u32.SetCursorPos(saved_pt.x, saved_pt.y)
+
+
+# ---------------------------------------------------------------------------
+# Tap-to-face-view
+# ---------------------------------------------------------------------------
+_TAP_ZONE_VIEWS = {
+    "center": kCubeViewFront,
+    "top":    kCubeViewTop,
+    "bottom": kCubeViewBottom,
+    "left":   kCubeViewLeft,
+    "right":  kCubeViewRight,
+}
+
+
+def _tap_zone(x: float, y: float) -> str:
+    """Map normalised (0–1) pad coords to one of five named zones."""
+    if x < TAP_ZONE_EDGE:          return "left"
+    if x > 1.0 - TAP_ZONE_EDGE:   return "right"
+    if y < TAP_ZONE_EDGE:          return "top"
+    if y > 1.0 - TAP_ZONE_EDGE:   return "bottom"
+    return "center"
+
+
+def apply_face_view(app, x: float, y: float) -> None:
+    """Snap the Inventor camera to the ViewCube face for the tapped pad zone."""
+    zone      = _tap_zone(x, y)
+    view_type = _TAP_ZONE_VIEWS[zone]
+
+    result = _active_view(app)
+    if result is None:
+        return
+    cam, _tg = result
+
+    try:
+        cam.SetToCubicView(view_type)
+        _apply_cam(cam)
+        _cs["valid"] = False   # force camera re-read on next gesture
+        log.info("face view snap: zone=%-8s  CubeViewType=%d", zone, view_type)
+    except Exception as e:
+        log.warning("apply_face_view(%s, type=%d): %s  "
+                    "(check CubeViewTypeEnum constants if this keeps failing)",
+                    zone, view_type, e)
 
 
 # ---------------------------------------------------------------------------
@@ -1218,6 +1312,7 @@ def main():
                                   _3d_mode_active.is_set(), buf.value)
                     gesture.reset()
                 else:
+                    tap_result  = None
                     pan_x_t = pan_z_t = zoom_t = twist_t = 0.0
                     orbit_dx = orbit_dy = 0.0
                     had_gesture = had_orbit = False
@@ -1226,7 +1321,9 @@ def main():
                         result = gesture.process(fingers)
                         if result is None:
                             continue
-                        if result["type"] == "orbit":
+                        if result["type"] == "tap":
+                            tap_result = result   # last tap in batch wins
+                        elif result["type"] == "orbit":
                             orbit_dx   += result["dx"]
                             orbit_dy   += result["dy"]
                             had_orbit   = True
@@ -1236,6 +1333,12 @@ def main():
                             zoom_t     += result["zoom"]
                             twist_t    += result["twist_y"]
                             had_gesture = True
+
+                    if tap_result is not None:
+                        try:
+                            apply_face_view(app, tap_result["x"], tap_result["y"])
+                        except Exception as e:
+                            log.warning("apply_face_view failed: %s", e)
 
                     if had_orbit:
                         try:
