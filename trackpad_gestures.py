@@ -125,7 +125,7 @@ LIFTOFF_WATCHDOG = 0.12
 # moved more than TAP_MAX_MOVE normalised units is treated as a "tap", which
 # snaps Inventor to the ViewCube face for that pad zone.
 # Short duration + tiny movement means virtually zero collision with orbit drags.
-TAP_MAX_DURATION = 0.18   # seconds
+TAP_MAX_DURATION = 0.80   # seconds  — raised; most taps land at 100–800 ms
 TAP_MAX_MOVE     = 0.04   # normalised pad units (~4 % of pad width)
 
 # Fraction of the pad edge that maps to a directional zone (L/R/T/B).
@@ -140,9 +140,9 @@ TAP_ZONE_EDGE = 0.25
 #
 # Defaults below: Y = height, Z = depth  (Inventor mechanical default for most parts)
 #   If your model uses Z = height, set WORLD_UP=(0,0,1) and WORLD_FRONT=(0,1,0)
-FACE_VIEW_WORLD_UP    = (0, 0, 1)   # Z is height
-FACE_VIEW_WORLD_FRONT = (0, -1, 0)  # Front face: camera sits on the -Y side, looking toward +Y
-                                    # (flip to (0, 1, 0) if tapping centre shows the back face)
+FACE_VIEW_WORLD_UP    = (0, 1, 0)   # Y is up  (standard Inventor orientation)
+FACE_VIEW_WORLD_FRONT = (0, 0, 1)   # Front face: camera on +Z side, looking toward –Z
+                                    # (flip to (0,0,-1) if centre tap shows the back)
 
 # ---------------------------------------------------------------------------
 # TrackPoint / UDP configuration  (mirrors inventor_camera_server.py)
@@ -532,19 +532,43 @@ class GestureRecognizer:
                           self._tap_start_x, self._tap_start_y,
                           (self._last_seen - self._tap_start_t) * 1000,
                           self._tap_max_disp)
+            else:
+                # Log the rejection reason to aid threshold tuning.
+                if self._last_count != 1:
+                    log.debug("tap rejected: last_count=%d (not a 1-finger lift)",
+                              self._last_count)
+                elif self._tap_start_t is None:
+                    log.debug("tap rejected: no candidate "
+                              "(real gesture movement cancelled it)")
+                elif (self._last_seen - self._tap_start_t) >= TAP_MAX_DURATION:
+                    log.debug("tap rejected: dur=%.0f ms > max=%.0f ms",
+                              (self._last_seen - self._tap_start_t) * 1000,
+                              TAP_MAX_DURATION * 1000)
+                elif self._tap_max_disp >= TAP_MAX_MOVE:
+                    log.debug("tap rejected: disp=%.3f > max=%.3f",
+                              self._tap_max_disp, TAP_MAX_MOVE)
             self.reset()
             return tap
 
         self._last_seen = now
 
-        # Finger-count change: clear old state so first frame of new gesture
-        # just records the baseline (no spurious jump).
-        # Also capture the previous count BEFORE updating, so the count==1
-        # branch below can distinguish a fresh 0→1 touch from a 2→1 reduction.
+        # Finger-count change: clear baseline state for new gesture.
+        # Capture prev_count BEFORE updating _last_count.
         prev_count = self._last_count
         if count != self._last_count:
-            self._prev_1x = self._prev_cx = None   # invalidate both
+            self._prev_1x = self._prev_cx = None
             self._last_count = count
+
+        # On the very first contact from idle (prev_count==0), init the tap
+        # candidate from the centroid of all current contacts.  This covers
+        # both 0→1 (normal tap) and 0→2 (WPT fat-finger briefly seen as 2).
+        if prev_count == 0:
+            cx_all = sum(f["x"] for f in fingers) / count
+            cy_all = sum(f["y"] for f in fingers) / count
+            self._tap_start_t  = now
+            self._tap_start_x  = cx_all
+            self._tap_start_y  = cy_all
+            self._tap_max_disp = 0.0
 
         # ---- one finger: orbit (or tap candidate) ----
         if count == 1:
@@ -552,18 +576,15 @@ class GestureRecognizer:
             cy = fingers[0]["y"]
             if self._prev_1x is None:
                 self._prev_1x, self._prev_1y = cx, cy
-                # Only record a tap candidate when this is a FRESH touch (0→1).
-                # A count reduction from a multi-finger gesture (2→1) must NOT
-                # start a tap — the user just lifted one finger mid-gesture.
-                if prev_count == 0:
-                    self._tap_start_t    = now
-                    self._tap_start_x    = cx
-                    self._tap_start_y    = cy
-                    self._tap_max_disp   = 0.0
-                else:
-                    self._tap_start_t = None   # kill any stale candidate
+                if prev_count >= 2 and self._tap_start_t is not None:
+                    # 2→1 with tap candidate still alive (WPT settled from 2 to 1,
+                    # no real gesture movement yet): update finger position but keep
+                    # the original start time so duration is measured correctly.
+                    self._tap_start_x  = cx
+                    self._tap_start_y  = cy
+                    self._tap_max_disp = 0.0
                 return None
-            # Keep running max displacement so a genuine orbit cancels tap.
+            # Track running displacement; a real orbit will exceed TAP_MAX_MOVE.
             disp = math.hypot(cx - self._tap_start_x, cy - self._tap_start_y) \
                    if self._tap_start_t is not None else 0.0
             self._tap_max_disp = max(self._tap_max_disp, disp)
@@ -573,8 +594,9 @@ class GestureRecognizer:
             return {"type": "orbit", "dx": dx, "dy": dy}
 
         # ---- two (or more) fingers: pan / zoom / twist ----
-        # Cancel any tap candidate — multi-finger gesture is never a tap.
-        self._tap_start_t = None
+        # Do NOT cancel the tap candidate here — wait until real movement is
+        # returned.  If the WPT briefly reports 2 contacts for a single fat-
+        # finger tap without any actual delta, the tap candidate survives.
         if count == 2:
             p1, p2 = fingers[0], fingers[1]
             sep = math.hypot(p2["x_raw"] - p1["x_raw"],
@@ -604,6 +626,8 @@ class GestureRecognizer:
             self._prev_cx, self._prev_cy = cx, cy
             self._prev_dist = dist
             self._prev_ang  = ang
+            # Real gesture movement confirmed — cancel any tap candidate now.
+            self._tap_start_t = None
             return {"type": "gesture",
                     "pan_x": pan_x, "pan_z": pan_z,
                     "zoom": zoom,   "twist_y": d_ang}
