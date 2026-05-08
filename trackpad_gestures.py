@@ -766,11 +766,33 @@ def apply_orbit(app, dx, dy):
 # Tap-to-face-view
 # ---------------------------------------------------------------------------
 _TAP_ZONE_VIEWS = {
-    "center": kCubeViewFront,
-    "top":    kCubeViewTop,
-    "bottom": kCubeViewBottom,
-    "left":   kCubeViewLeft,
-    "right":  kCubeViewRight,
+    "center": "front",
+    "top":    "top",
+    "bottom": "bottom",
+    "left":   "left",
+    "right":  "right",
+}
+
+# Named method approach (iLogic / VBA style — Inventor 2024).
+# Camera.SetToCubicXxxView() sets the orientation; Camera.ApplyFit() applies + fits.
+_ZONE_CUBIC_METHOD = {
+    "front":  "SetToCubicFrontView",
+    "back":   "SetToCubicBackView",
+    "top":    "SetToCubicTopView",
+    "bottom": "SetToCubicBottomView",
+    "left":   "SetToCubicLeftView",
+    "right":  "SetToCubicRightView",
+}
+
+# ViewOrientationType property fallback — integer constants from the
+# ViewOrientationTypeEnum (eFrontViewOrientation = 61696, etc.)
+_ZONE_ORIENTATION_TYPE = {
+    "front":  61696,
+    "back":   61697,
+    "left":   61698,
+    "right":  61699,
+    "top":    61700,
+    "bottom": 61701,
 }
 
 
@@ -784,24 +806,73 @@ def _tap_zone(x: float, y: float) -> str:
 
 
 def apply_face_view(app, x: float, y: float) -> None:
-    """Snap the Inventor camera to the ViewCube face for the tapped pad zone."""
+    """Snap the Inventor camera to the ViewCube face for the tapped pad zone.
+
+    Tries two COM API approaches in order:
+      1. Camera.SetToCubicXxxView() + Camera.ApplyFit()  (iLogic/VBA style)
+      2. Camera.ViewOrientationType = N  + Camera.Apply()  (property style)
+    Whichever succeeds is logged at INFO level so you know which one works.
+    """
     zone      = _tap_zone(x, y)
-    view_type = _TAP_ZONE_VIEWS[zone]
+    face_name = _TAP_ZONE_VIEWS[zone]
 
-    result = _active_view(app)
-    if result is None:
-        return
-    cam, _tg = result
-
+    # Use ActiveView.Camera (matches iLogic's ThisApplication.ActiveView.Camera).
     try:
-        cam.SetToCubicView(view_type)
-        _apply_cam(cam)
-        _cs["valid"] = False   # force camera re-read on next gesture
-        log.info("face view snap: zone=%-8s  CubeViewType=%d", zone, view_type)
+        doc = app.ActiveDocument
+        if doc is None:
+            return
+        if doc.DocumentType not in (kPartDocumentObject, kAssemblyDocumentObject,
+                                    kDrawingDocumentObject):
+            return
+        view = doc.ActiveView
+        cam  = view.Camera
     except Exception as e:
-        log.warning("apply_face_view(%s, type=%d): %s  "
-                    "(check CubeViewTypeEnum constants if this keeps failing)",
-                    zone, view_type, e)
+        log.debug("apply_face_view: could not get ActiveView.Camera: %s", e)
+        return
+
+    # --- Approach 1: SetToCubicXxxView() ---
+    method_name = _ZONE_CUBIC_METHOD[face_name]
+    try:
+        getattr(cam, method_name)()
+        try:
+            cam.ApplyFit()
+        except Exception:
+            _apply_cam(cam)
+        try:
+            view.Update()
+        except Exception:
+            pass
+        _cs["valid"] = False
+        log.info("face view snap: zone=%-8s  method=%s", zone, method_name)
+        return
+    except AttributeError:
+        log.debug("face view: %s not in dispatch — trying ViewOrientationType", method_name)
+    except Exception as e:
+        log.debug("face view: %s raised %s — trying ViewOrientationType", method_name, e)
+
+    # --- Approach 2: ViewOrientationType property ---
+    orientation_type = _ZONE_ORIENTATION_TYPE[face_name]
+    try:
+        cam.ViewOrientationType = orientation_type
+        try:
+            cam.ApplyFit()
+        except Exception:
+            _apply_cam(cam)
+        try:
+            view.Update()
+        except Exception:
+            pass
+        _cs["valid"] = False
+        log.info("face view snap: zone=%-8s  ViewOrientationType=%d", zone, orientation_type)
+        return
+    except AttributeError:
+        log.debug("face view: ViewOrientationType not in dispatch")
+    except Exception as e:
+        log.debug("face view: ViewOrientationType=%d raised %s", orientation_type, e)
+
+    log.warning("face view: both methods failed for zone=%s  "
+                "— Camera dispatch does not expose standard-view methods. "
+                "Check the log at DEBUG level for details.", zone)
 
 
 # ---------------------------------------------------------------------------
