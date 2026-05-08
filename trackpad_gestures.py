@@ -132,6 +132,17 @@ TAP_MAX_MOVE     = 0.04   # normalised pad units (~4 % of pad width)
 # 0.25 → outer 25 % of each side is directional; inner 50 % is centre.
 TAP_ZONE_EDGE = 0.25
 
+# World coordinate axes used for the manual face-snap fallback.
+# These define which directions correspond to Front/Top/Right in your model.
+# FACE_VIEW_WORLD_UP    = the model's "height" axis (which way is "up")
+# FACE_VIEW_WORLD_FRONT = the direction the camera sits when showing the Front face
+#                         (i.e. eye is placed at  target + FRONT * r  for "Front" view)
+#
+# Defaults below: Y = height, Z = depth  (Inventor mechanical default for most parts)
+#   If your model uses Z = height, set WORLD_UP=(0,0,1) and WORLD_FRONT=(0,1,0)
+FACE_VIEW_WORLD_UP    = (0, 1, 0)
+FACE_VIEW_WORLD_FRONT = (0, 0, 1)
+
 # ---------------------------------------------------------------------------
 # TrackPoint / UDP configuration  (mirrors inventor_camera_server.py)
 # ---------------------------------------------------------------------------
@@ -160,21 +171,6 @@ TP_ORBIT_INERTIA = 0.2
 kPartDocumentObject     = 12290
 kAssemblyDocumentObject = 12291
 kDrawingDocumentObject  = 12292
-
-# ---------------------------------------------------------------------------
-# Inventor ViewCube face constants  (CubeViewTypeEnum)
-# Passed to Camera.SetToCubicView() — respects any custom ViewCube orientation
-# the user has set via right-click → "Set Current View as Front" etc.
-# NOTE: If a constant triggers a COM exception the log will say so; the
-# correct values can then be read from the Inventor SDK CHM.
-# ---------------------------------------------------------------------------
-kCubeViewIsometric = 65536   # 0x10000
-kCubeViewTop       = 65537   # 0x10001
-kCubeViewBottom    = 65538   # 0x10002
-kCubeViewFront     = 65539   # 0x10003
-kCubeViewBack      = 65540   # 0x10004
-kCubeViewLeft      = 65541   # 0x10005
-kCubeViewRight     = 65542   # 0x10006
 
 # ---------------------------------------------------------------------------
 # Persistent camera state (shared with orbit calls)
@@ -808,27 +804,18 @@ def _tap_zone(x: float, y: float) -> str:
 def apply_face_view(app, x: float, y: float) -> None:
     """Snap the Inventor camera to the ViewCube face for the tapped pad zone.
 
-    Tries two COM API approaches in order:
-      1. Camera.SetToCubicXxxView() + Camera.ApplyFit()  (iLogic/VBA style)
-      2. Camera.ViewOrientationType = N  + Camera.Apply()  (property style)
-    Whichever succeeds is logged at INFO level so you know which one works.
+    Tries three approaches in order, stopping at the first that works:
+      1. Camera.SetToCubicXxxView()  (iLogic / VBA style — may not be in dispatch)
+      2. Camera.ViewOrientationType  (property — may be read-only on this build)
+      3. Manual Eye/Target/UpVector  (always works; uses FACE_VIEW_WORLD_UP/FRONT)
     """
     zone      = _tap_zone(x, y)
     face_name = _TAP_ZONE_VIEWS[zone]
 
-    # Use the same camera acquisition path that orbit/pan/zoom use successfully.
-    try:
-        doc = app.ActiveDocument
-        if doc is None:
-            return
-        if doc.DocumentType not in (kPartDocumentObject, kAssemblyDocumentObject,
-                                    kDrawingDocumentObject):
-            return
-        view = doc.Views.Item(1)
-        cam  = view.Camera
-    except Exception as e:
-        log.debug("apply_face_view: could not get camera: %s", e)
+    result = _active_view(app)
+    if result is None:
         return
+    cam, tg = result
 
     # --- Approach 1: SetToCubicXxxView() ---
     method_name = _ZONE_CUBIC_METHOD[face_name]
@@ -862,9 +849,44 @@ def apply_face_view(app, x: float, y: float) -> None:
     except Exception as e:
         log.debug("face view: ViewOrientationType=%d raised %s", orientation_type, e)
 
-    log.warning("face view: both methods failed for zone=%s  "
-                "— Camera dispatch does not expose standard-view methods. "
-                "Check the log at DEBUG level for details.", zone)
+    # --- Approach 3: Manual Eye/Target/UpVector (guaranteed to work) ---
+    # Computes absolute face positions from FACE_VIEW_WORLD_UP / FACE_VIEW_WORLD_FRONT.
+    # Keeps the current Target and eye-target distance; only the viewing direction changes.
+    now = time.monotonic()
+    if not _cs["valid"] or (now - _cs["last_t"]) > RESYNC_IDLE:
+        if not _read_cam(cam):
+            return
+
+    # Derive world axes from the configured constants.
+    fv_up    = np.array(FACE_VIEW_WORLD_UP,    dtype=float)
+    fv_front = np.array(FACE_VIEW_WORLD_FRONT, dtype=float)
+    fv_up    = fv_up    / np.linalg.norm(fv_up)
+    fv_front = fv_front / np.linalg.norm(fv_front)
+    fv_right = np.cross(fv_up, fv_front)
+    fv_right = fv_right / np.linalg.norm(fv_right)
+
+    # Eye-from-target direction and camera up for each face.
+    eye_dirs = {
+        "front":  ( fv_front, fv_up),
+        "back":   (-fv_front, fv_up),
+        "left":   (-fv_right, fv_up),
+        "right":  ( fv_right, fv_up),
+        "top":    ( fv_up,   -fv_front),   # looking down; front appears at bottom of viewport
+        "bottom": (-fv_up,    fv_front),   # looking up;   front appears at top of viewport
+    }
+    eye_dir, cam_up = eye_dirs[face_name]
+
+    target  = _cs["target"].copy()
+    r       = _cs["r"]
+    new_eye = target + eye_dir * r
+
+    cam.Eye      = tg.CreatePoint(     float(new_eye[0]),  float(new_eye[1]),  float(new_eye[2]))
+    cam.Target   = tg.CreatePoint(     float(target[0]),   float(target[1]),   float(target[2]))
+    cam.UpVector = tg.CreateUnitVector(float(cam_up[0]),   float(cam_up[1]),   float(cam_up[2]))
+    _apply_cam(cam)
+    _cs.update(eye=new_eye, target=target, up=cam_up.copy(), r=r, last_t=now, valid=True)
+    log.info("face view snap: zone=%-8s  manual  "
+             "(adjust FACE_VIEW_WORLD_UP/FRONT if faces are wrong)", zone)
 
 
 # ---------------------------------------------------------------------------
