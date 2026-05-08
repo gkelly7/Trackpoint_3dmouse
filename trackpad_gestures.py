@@ -140,8 +140,9 @@ TAP_ZONE_EDGE = 0.25
 #
 # Defaults below: Y = height, Z = depth  (Inventor mechanical default for most parts)
 #   If your model uses Z = height, set WORLD_UP=(0,0,1) and WORLD_FRONT=(0,1,0)
-FACE_VIEW_WORLD_UP    = (0, 1, 0)
-FACE_VIEW_WORLD_FRONT = (0, 0, 1)
+FACE_VIEW_WORLD_UP    = (0, 0, 1)   # Z is height
+FACE_VIEW_WORLD_FRONT = (0, -1, 0)  # Front face: camera sits on the -Y side, looking toward +Y
+                                    # (flip to (0, 1, 0) if tapping centre shows the back face)
 
 # ---------------------------------------------------------------------------
 # TrackPoint / UDP configuration  (mirrors inventor_camera_server.py)
@@ -769,28 +770,6 @@ _TAP_ZONE_VIEWS = {
     "right":  "right",
 }
 
-# Named method approach (iLogic / VBA style — Inventor 2024).
-# Camera.SetToCubicXxxView() sets the orientation; Camera.ApplyFit() applies + fits.
-_ZONE_CUBIC_METHOD = {
-    "front":  "SetToCubicFrontView",
-    "back":   "SetToCubicBackView",
-    "top":    "SetToCubicTopView",
-    "bottom": "SetToCubicBottomView",
-    "left":   "SetToCubicLeftView",
-    "right":  "SetToCubicRightView",
-}
-
-# ViewOrientationType property fallback — integer constants from the
-# ViewOrientationTypeEnum (eFrontViewOrientation = 61696, etc.)
-_ZONE_ORIENTATION_TYPE = {
-    "front":  61696,
-    "back":   61697,
-    "left":   61698,
-    "right":  61699,
-    "top":    61700,
-    "bottom": 61701,
-}
-
 
 def _tap_zone(x: float, y: float) -> str:
     """Map normalised (0–1) pad coords to one of five named zones."""
@@ -802,91 +781,77 @@ def _tap_zone(x: float, y: float) -> str:
 
 
 def apply_face_view(app, x: float, y: float) -> None:
-    """Snap the Inventor camera to the ViewCube face for the tapped pad zone.
+    """Snap the Inventor camera to an axis-aligned face for the tapped pad zone.
 
-    Tries three approaches in order, stopping at the first that works:
-      1. Camera.SetToCubicXxxView()  (iLogic / VBA style — may not be in dispatch)
-      2. Camera.ViewOrientationType  (property — may be read-only on this build)
-      3. Manual Eye/Target/UpVector  (always works; uses FACE_VIEW_WORLD_UP/FRONT)
+    Uses Camera.Eye / Target / UpVector / Apply() — the same API path that
+    orbit and pan use, so it is guaranteed to work.
+
+    Coordinate convention is configured by FACE_VIEW_WORLD_UP / FRONT at the
+    top of this file.  Default: Z = height, Y = depth, X = width.
+
+    If a face shows the wrong side, flip the sign of FACE_VIEW_WORLD_FRONT.
+    If top/bottom are swapped, flip the sign of FACE_VIEW_WORLD_UP.
     """
     zone      = _tap_zone(x, y)
     face_name = _TAP_ZONE_VIEWS[zone]
 
     result = _active_view(app)
     if result is None:
+        log.debug("face view: _active_view returned None")
         return
     cam, tg = result
 
-    # --- Approach 1: SetToCubicXxxView() ---
-    method_name = _ZONE_CUBIC_METHOD[face_name]
-    try:
-        getattr(cam, method_name)()
-        try:
-            cam.ApplyFit()
-        except Exception:
-            _apply_cam(cam)
-        _cs["valid"] = False
-        log.info("face view snap: zone=%-8s  method=%s", zone, method_name)
-        return
-    except AttributeError:
-        log.debug("face view: %s not in dispatch — trying ViewOrientationType", method_name)
-    except Exception as e:
-        log.debug("face view: %s raised %s — trying ViewOrientationType", method_name, e)
-
-    # --- Approach 2: ViewOrientationType property ---
-    orientation_type = _ZONE_ORIENTATION_TYPE[face_name]
-    try:
-        cam.ViewOrientationType = orientation_type
-        try:
-            cam.ApplyFit()
-        except Exception:
-            _apply_cam(cam)
-        _cs["valid"] = False
-        log.info("face view snap: zone=%-8s  ViewOrientationType=%d", zone, orientation_type)
-        return
-    except AttributeError:
-        log.debug("face view: ViewOrientationType not in dispatch")
-    except Exception as e:
-        log.debug("face view: ViewOrientationType=%d raised %s", orientation_type, e)
-
-    # --- Approach 3: Manual Eye/Target/UpVector (guaranteed to work) ---
-    # Computes absolute face positions from FACE_VIEW_WORLD_UP / FACE_VIEW_WORLD_FRONT.
-    # Keeps the current Target and eye-target distance; only the viewing direction changes.
+    # Ensure camera state is current (needed for target position and r).
     now = time.monotonic()
     if not _cs["valid"] or (now - _cs["last_t"]) > RESYNC_IDLE:
         if not _read_cam(cam):
+            log.debug("face view: _read_cam failed")
             return
 
-    # Derive world axes from the configured constants.
-    fv_up    = np.array(FACE_VIEW_WORLD_UP,    dtype=float)
-    fv_front = np.array(FACE_VIEW_WORLD_FRONT, dtype=float)
-    fv_up    = fv_up    / np.linalg.norm(fv_up)
-    fv_front = fv_front / np.linalg.norm(fv_front)
-    fv_right = np.cross(fv_up, fv_front)
-    fv_right = fv_right / np.linalg.norm(fv_right)
+    # Derive orthogonal world axes from the configured constants.
+    up_v    = np.array(FACE_VIEW_WORLD_UP,    dtype=float)
+    front_v = np.array(FACE_VIEW_WORLD_FRONT, dtype=float)
+    up_v    = up_v    / np.linalg.norm(up_v)
+    front_v = front_v / np.linalg.norm(front_v)
+    right_v = np.cross(up_v, front_v)
+    right_v = right_v / np.linalg.norm(right_v)
 
-    # Eye-from-target direction and camera up for each face.
-    eye_dirs = {
-        "front":  ( fv_front, fv_up),
-        "back":   (-fv_front, fv_up),
-        "left":   (-fv_right, fv_up),
-        "right":  ( fv_right, fv_up),
-        "top":    ( fv_up,   -fv_front),   # looking down; front appears at bottom of viewport
-        "bottom": (-fv_up,    fv_front),   # looking up;   front appears at top of viewport
+    # Absolute eye-from-target direction and camera up-vector for each face.
+    face_params = {
+        #           eye sits at …      camera "up" on screen
+        "front":  ( front_v,  up_v),
+        "back":   (-front_v,  up_v),
+        "left":   (-right_v,  up_v),
+        "right":  ( right_v,  up_v),
+        "top":    ( up_v,    -front_v),   # looking down; front of model at bottom
+        "bottom": (-up_v,     front_v),   # looking up;   front of model at top
     }
-    eye_dir, cam_up = eye_dirs[face_name]
+    eye_dir, cam_up = face_params[face_name]
 
     target  = _cs["target"].copy()
     r       = _cs["r"]
     new_eye = target + eye_dir * r
 
-    cam.Eye      = tg.CreatePoint(     float(new_eye[0]),  float(new_eye[1]),  float(new_eye[2]))
-    cam.Target   = tg.CreatePoint(     float(target[0]),   float(target[1]),   float(target[2]))
-    cam.UpVector = tg.CreateUnitVector(float(cam_up[0]),   float(cam_up[1]),   float(cam_up[2]))
-    _apply_cam(cam)
-    _cs.update(eye=new_eye, target=target, up=cam_up.copy(), r=r, last_t=now, valid=True)
-    log.info("face view snap: zone=%-8s  manual  "
-             "(adjust FACE_VIEW_WORLD_UP/FRONT if faces are wrong)", zone)
+    log.debug("face view: zone=%s  eye=(%.1f, %.1f, %.1f)  target=(%.1f, %.1f, %.1f)  r=%.1f",
+              zone,
+              new_eye[0], new_eye[1], new_eye[2],
+              target[0],  target[1],  target[2],
+              r)
+
+    try:
+        cam.Eye      = tg.CreatePoint(     float(new_eye[0]), float(new_eye[1]), float(new_eye[2]))
+        cam.Target   = tg.CreatePoint(     float(target[0]),  float(target[1]),  float(target[2]))
+        cam.UpVector = tg.CreateUnitVector(float(cam_up[0]),  float(cam_up[1]),  float(cam_up[2]))
+        # Fit tries to frame the whole model — helps when snapping from a close-up.
+        try:
+            cam.Fit()
+        except Exception:
+            pass
+        _apply_cam(cam)
+        _cs["valid"] = False   # force re-read on next gesture
+        log.info("face view snap: zone=%-8s  face=%s", zone, face_name)
+    except Exception as e:
+        log.warning("face view snap failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
