@@ -816,7 +816,7 @@ def apply_face_view(app, x: float, y: float) -> None:
     zone      = _tap_zone(x, y)
     face_name = _TAP_ZONE_VIEWS[zone]
 
-    # Use ActiveView.Camera (matches iLogic's ThisApplication.ActiveView.Camera).
+    # Use the same camera acquisition path that orbit/pan/zoom use successfully.
     try:
         doc = app.ActiveDocument
         if doc is None:
@@ -824,10 +824,10 @@ def apply_face_view(app, x: float, y: float) -> None:
         if doc.DocumentType not in (kPartDocumentObject, kAssemblyDocumentObject,
                                     kDrawingDocumentObject):
             return
-        view = doc.ActiveView
+        view = doc.Views.Item(1)
         cam  = view.Camera
     except Exception as e:
-        log.debug("apply_face_view: could not get ActiveView.Camera: %s", e)
+        log.debug("apply_face_view: could not get camera: %s", e)
         return
 
     # --- Approach 1: SetToCubicXxxView() ---
@@ -838,10 +838,6 @@ def apply_face_view(app, x: float, y: float) -> None:
             cam.ApplyFit()
         except Exception:
             _apply_cam(cam)
-        try:
-            view.Update()
-        except Exception:
-            pass
         _cs["valid"] = False
         log.info("face view snap: zone=%-8s  method=%s", zone, method_name)
         return
@@ -858,10 +854,6 @@ def apply_face_view(app, x: float, y: float) -> None:
             cam.ApplyFit()
         except Exception:
             _apply_cam(cam)
-        try:
-            view.Update()
-        except Exception:
-            pass
         _cs["valid"] = False
         log.info("face view snap: zone=%-8s  ViewOrientationType=%d", zone, orientation_type)
         return
