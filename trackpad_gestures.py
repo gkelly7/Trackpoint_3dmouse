@@ -47,7 +47,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8"),
+        logging.FileHandler(LOG_FILE, mode="w", encoding="utf-8"),
     ],
 )
 log = logging.getLogger(__name__)
@@ -1419,6 +1419,9 @@ def main():
             # force-clear the cursor/scroll suppression flags.  Many WPT
             # drivers stop sending reports on lift without a final count=0
             # report, which would otherwise permanently block the mouse cursor.
+            # IMPORTANT: use gesture.process([]) rather than gesture.reset() so
+            # that a pending tap candidate is checked and emitted before state
+            # is cleared — reset() would silently discard it.
             if _single_finger_active.is_set() or _two_fingers_active.is_set():
                 if (now - _last_touch_t[0]) > LIFTOFF_WATCHDOG:
                     log.debug("watchdog: releasing touch flags "
@@ -1426,7 +1429,15 @@ def main():
                               (now - _last_touch_t[0]) * 1000)
                     _single_finger_active.clear()
                     _two_fingers_active.clear()
-                    gesture.reset()
+                    watchdog_tap = gesture.process([])
+                    if (watchdog_tap is not None
+                            and app is not None
+                            and _3d_mode_active.is_set()
+                            and _inventor_is_foreground()):
+                        try:
+                            apply_face_view(app, watchdog_tap["x"], watchdog_tap["y"])
+                        except Exception as e:
+                            log.warning("watchdog apply_face_view failed: %s", e)
 
             time.sleep(0.01)   # 10 ms tick
 
