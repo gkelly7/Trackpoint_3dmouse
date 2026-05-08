@@ -248,6 +248,8 @@ HID_USAGE_TOUCHPAD       = 0x05
 # on the same touchpad events natively.
 WH_MOUSE_LL    = 14
 WM_MOUSEMOVE   = 0x0200
+WM_LBUTTONDOWN = 0x0201
+WM_LBUTTONUP   = 0x0202
 WM_MOUSEWHEEL  = 0x020A
 WM_MOUSEHWHEEL = 0x020E
 _LL_HOOKPROC   = ctypes.WINFUNCTYPE(
@@ -537,6 +539,9 @@ class GestureRecognizer:
 
         # Finger-count change: clear old state so first frame of new gesture
         # just records the baseline (no spurious jump).
+        # Also capture the previous count BEFORE updating, so the count==1
+        # branch below can distinguish a fresh 0→1 touch from a 2→1 reduction.
+        prev_count = self._last_count
         if count != self._last_count:
             self._prev_1x = self._prev_cx = None   # invalidate both
             self._last_count = count
@@ -547,21 +552,29 @@ class GestureRecognizer:
             cy = fingers[0]["y"]
             if self._prev_1x is None:
                 self._prev_1x, self._prev_1y = cx, cy
-                # Record tap candidate on first contact.
-                self._tap_start_t    = now
-                self._tap_start_x    = cx
-                self._tap_start_y    = cy
-                self._tap_max_disp   = 0.0
+                # Only record a tap candidate when this is a FRESH touch (0→1).
+                # A count reduction from a multi-finger gesture (2→1) must NOT
+                # start a tap — the user just lifted one finger mid-gesture.
+                if prev_count == 0:
+                    self._tap_start_t    = now
+                    self._tap_start_x    = cx
+                    self._tap_start_y    = cy
+                    self._tap_max_disp   = 0.0
+                else:
+                    self._tap_start_t = None   # kill any stale candidate
                 return None
             # Keep running max displacement so a genuine orbit cancels tap.
-            disp = math.hypot(cx - self._tap_start_x, cy - self._tap_start_y)
+            disp = math.hypot(cx - self._tap_start_x, cy - self._tap_start_y) \
+                   if self._tap_start_t is not None else 0.0
             self._tap_max_disp = max(self._tap_max_disp, disp)
             dx = cx - self._prev_1x
             dy = cy - self._prev_1y
             self._prev_1x, self._prev_1y = cx, cy
             return {"type": "orbit", "dx": dx, "dy": dy}
 
-        # ---- two fingers: pan / zoom / twist ----
+        # ---- two (or more) fingers: pan / zoom / twist ----
+        # Cancel any tap candidate — multi-finger gesture is never a tap.
+        self._tap_start_t = None
         if count == 2:
             p1, p2 = fingers[0], fingers[1]
             sep = math.hypot(p2["x_raw"] - p1["x_raw"],
@@ -1074,14 +1087,18 @@ class TouchpadListener:
         # set by on_fingers (also this thread) is always up-to-date.
         def _ll_mouse_hook(nCode, wParam, lParam):
             if nCode >= 0:
-                # Suppress scroll events while two fingers are on the pad (pinch / pan)
-                if wParam in (WM_MOUSEWHEEL, WM_MOUSEHWHEEL) and _two_fingers_active.is_set():
-                    return 1   # consume — do NOT forward to apps
-                # Suppress cursor movement while one finger is on the pad (orbit).
-                # This prevents the touchpad from moving the system cursor while
-                # the user is orbiting the model with a single finger.
-                if wParam == WM_MOUSEMOVE and _single_finger_active.is_set():
-                    return 1   # consume
+                active_3d = _3d_mode_active.is_set() and _inventor_is_foreground()
+                # Suppress scroll events while two fingers are on the pad.
+                if active_3d and _two_fingers_active.is_set():
+                    if wParam in (WM_MOUSEWHEEL, WM_MOUSEHWHEEL):
+                        return 1   # consume
+                # Suppress cursor movement AND tap-clicks while one finger is
+                # on the pad (orbit mode).  The WPT driver synthesises a
+                # WM_LBUTTONDOWN/UP from every tap; eating it here prevents
+                # accidental selections/clicks landing in Inventor.
+                if active_3d and _single_finger_active.is_set():
+                    if wParam in (WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP):
+                        return 1   # consume
             return _u32.CallNextHookEx(None, nCode, wParam, lParam)
 
         self._ll_hook_cb = _LL_HOOKPROC(_ll_mouse_hook)  # keep ref alive
